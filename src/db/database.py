@@ -23,11 +23,3 @@ async_session_maker_null_pool = async_sessionmaker(bind=engine_null_pool, expire
 class Base(DeclarativeBase):
     pass
 
-
-def load_db_models() -> None:
-    from src.moduls.auth.auth_permission import AuthPermission  # noqa: F401
-    from src.moduls.auth.auth_role import AuthRole  # noqa: F401
-    from src.moduls.auth.auth_role_permission import AuthRolePermission  # noqa: F401
-    from src.moduls.auth.auth_user import AuthUser  # noqa: F401
-    from src.moduls.auth.auth_user_role import AuthUserRole  # noqa: F401
-    from src.moduls.moex.moex_share import MoexShare  # noqa: F401

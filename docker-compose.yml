@@ -15,14 +15,55 @@ services:
       DB_NAME: ${DB_NAME}
       REDIS_HOST: ${REDIS_HOST}
       REDIS_PORT: ${REDIS_PORT}
-      AUTH_JWT_SECRET: ${AUTH_JWT_SECRET}
-      AUTH_JWT_ALGORITHM: ${AUTH_JWT_ALGORITHM}
-      AUTH_ACCESS_TOKEN_MINUTES: ${AUTH_ACCESS_TOKEN_MINUTES}
-      AUTH_REFRESH_TOKEN_DAYS: ${AUTH_REFRESH_TOKEN_DAYS}
-    dns:
-      - 1.1.1.1
-      - 8.8.8.8
-      - 9.9.9.9
+      TBANK_INVEST_TOKEN: ${TBANK_INVEST_TOKEN}
+      TBANK_INVEST_BASE_URL: ${TBANK_INVEST_BASE_URL}
+      TBANK_INVEST_TIMEOUT_SECONDS: ${TBANK_INVEST_TIMEOUT_SECONDS}
+      TBANK_INVEST_SSL_VERIFY: ${TBANK_INVEST_SSL_VERIFY}
+      TBANK_INVEST_CA_BUNDLE_PATH: ${TBANK_INVEST_CA_BUNDLE_PATH}
+      TASKIQ_QUEUE_NAME: ${TASKIQ_QUEUE_NAME}
+      TBANK_SYNC_INTERVAL_SECONDS: ${TBANK_SYNC_INTERVAL_SECONDS:-120}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  bot:
+    build:
+      context: .
+      dockerfile: bot_service/Dockerfile
+    container_name: moex_bot
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      BACKEND_API_BASE_URL: ${BACKEND_API_BASE_URL:-http://backend:8000}
+      BACKEND_API_TIMEOUT_SECONDS: ${BACKEND_API_TIMEOUT_SECONDS:-20}
+    depends_on:
+      backend:
+        condition: service_started
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: moex_worker
+    restart: unless-stopped
+    command: ["taskiq", "worker", "src.tasks.broker:broker", "src.moduls.tbank.tasks"]
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASS: ${DB_PASS}
+      DB_NAME: ${DB_NAME}
+      REDIS_HOST: ${REDIS_HOST}
+      REDIS_PORT: ${REDIS_PORT}
+      TBANK_INVEST_TOKEN: ${TBANK_INVEST_TOKEN}
+      TBANK_INVEST_BASE_URL: ${TBANK_INVEST_BASE_URL}
+      TBANK_INVEST_TIMEOUT_SECONDS: ${TBANK_INVEST_TIMEOUT_SECONDS}
+      TBANK_INVEST_SSL_VERIFY: ${TBANK_INVEST_SSL_VERIFY}
+      TBANK_INVEST_CA_BUNDLE_PATH: ${TBANK_INVEST_CA_BUNDLE_PATH}
+      TASKIQ_QUEUE_NAME: ${TASKIQ_QUEUE_NAME}
+      TBANK_SYNC_INTERVAL_SECONDS: ${TBANK_SYNC_INTERVAL_SECONDS:-120}
     depends_on:
       postgres:
         condition: service_healthy

@@ -7,13 +7,19 @@ class DBManager:
 
     async def __aenter__(self):
         self.session = self.session_factory()
-        from src.moduls.auth.access_repository import AccessRepository
-        from src.moduls.auth.auth_repository import AuthUserRepository
-        from src.moduls.moex.moex_repository import MoexShareRepository
+        from src.moduls.tbank.repository import (
+            TBankFavoriteShareRepository,
+            TBankPriceMonitorRepository,
+            TBankSharePriceRepository,
+            TBankShareRepository,
+            TBankUserCredentialRepository,
+        )
 
-        self.access = AccessRepository(self.session)
-        self.auth_user = AuthUserRepository(self.session)
-        self.moex_share = MoexShareRepository(self.session)
+        self.tbank_share_price = TBankSharePriceRepository(self.session)
+        self.tbank_share = TBankShareRepository(self.session)
+        self.tbank_user_credential = TBankUserCredentialRepository(self.session)
+        self.tbank_favorite_share = TBankFavoriteShareRepository(self.session)
+        self.tbank_price_monitor = TBankPriceMonitorRepository(self.session)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):

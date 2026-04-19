@@ -1,0 +1,28 @@
+from aiogram.fsm.state import State, StatesGroup
+
+
+class SharesBrowserStates(StatesGroup):
+    browsing_list = State()
+    viewing_details = State()
+    shares_search_query = State()
+    monitoring_select_sector = State()
+    monitoring_select_company = State()
+    monitoring_set_interval = State()
+    monitoring_set_threshold_percent = State()
+    monitoring_set_threshold_rub = State()
+    order_select_type = State()
+    order_select_figi = State()
+    order_select_direction = State()
+    order_set_quantity = State()
+    order_set_price = State()
+    stop_select_type = State()
+    stop_select_figi = State()
+    stop_select_direction = State()
+    stop_set_quantity = State()
+    stop_set_stop_price = State()
+    stop_set_limit_price = State()
+    profile_set_token = State()
+    profile_set_account_id = State()
+    operations_set_days = State()
+    monitor_edit_threshold_percent = State()
+    monitor_edit_threshold_rub = State()

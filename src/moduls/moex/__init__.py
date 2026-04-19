@@ -1,1 +1,0 @@
-"""MOEX module package."""

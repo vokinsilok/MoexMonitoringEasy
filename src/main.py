@@ -1,53 +1,70 @@
 from contextlib import asynccontextmanager
+import asyncio
 
 import uvicorn
 from fastapi import APIRouter, FastAPI
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
 
+from src.core.logging import main_logger
 from src.db.database import async_session_maker
+from src.core.config import settings
 from src.init import redis_manager
-from src.moduls.auth.access_policy import public_access_meta
-from src.moduls.auth.access_service import AccessService
-from src.moduls.auth.auth_router import auth_router
-from src.moduls.moex.moex_router import moex_router
+from src.moduls.tbank.router import tbank_router
+from src.moduls.tbank.tasks import sync_russian_shares_task
+from src.tasks.broker import broker as taskiq_broker
 from src.utils.db_manager import DBManager
+
 
 
 @asynccontextmanager
 async def lifespan(add: FastAPI):
-    async with DBManager(async_session_maker) as db:
-        async with db.transaction():
-            await AccessService(db).sync_permissions_from_app(add)
-    print("Подключение к Redis...")
+    permission_codes: set[str] = set()
+    for route in add.routes:
+        if not isinstance(route, APIRoute):
+            continue
+
+    stop_event = asyncio.Event()
+
+    async def schedule_periodic_tbank_sync() -> None:
+        interval_seconds = max(10, settings.TBANK_SYNC_INTERVAL_SECONDS)
+        while not stop_event.is_set():
+            try:
+                await sync_russian_shares_task.kiq()
+            except Exception as exc:
+                main_logger.info(f"Failed to enqueue periodic T-Bank sync task: {exc}")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+            except TimeoutError:
+                continue
+
+    main_logger.info("Connecting to Redis...")
     await redis_manager.connect()
+    await taskiq_broker.startup()
+    periodic_sync_task = asyncio.create_task(schedule_periodic_tbank_sync())
     try:
         yield
     finally:
-        print("Отключение от Redis...")
+        stop_event.set()
+        await periodic_sync_task
+        await taskiq_broker.shutdown()
+        main_logger.info("Disconnecting from Redis...")
         await redis_manager.close()
 
 
 app = FastAPI(lifespan=lifespan, openapi_url=None, docs_url=None, redoc_url=None)
 main_router = APIRouter(prefix="/api/v1")
-main_router.include_router(auth_router)
-main_router.include_router(moex_router)
+main_router.include_router(tbank_router)
 
 
-@main_router.get(
-    "/openapi.json",
-    include_in_schema=False,
-    openapi_extra=public_access_meta(),
-)
+@main_router.get("/openapi.json", include_in_schema=False)
 async def custom_openapi():
     return JSONResponse(app.openapi())
 
 
-@main_router.get(
-    "/docs",
-    include_in_schema=False,
-    openapi_extra=public_access_meta(),
-)
+@main_router.get("/docs", include_in_schema=False)
 async def custom_swagger_ui_html():
     return get_swagger_ui_html(
         openapi_url="/api/v1/openapi.json",

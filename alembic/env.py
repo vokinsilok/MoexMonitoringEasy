@@ -8,7 +8,8 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from src.core.config import settings
-from src.db.database import Base, load_db_models
+from src.db.database import Base
+from src.moduls.tbank.models import TBankPriceMonitor, TBankShare, TBankUserCredential
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.db_url)
@@ -16,7 +17,6 @@ config.set_main_option("sqlalchemy.url", settings.db_url)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-load_db_models()
 target_metadata = Base.metadata
 
 
