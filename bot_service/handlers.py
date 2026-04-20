@@ -99,6 +99,9 @@ MON_CB_EDIT_RUB_PREFIX = "mon:edit_rub"
 MON_CB_EDIT_BACK_PREFIX = "mon:edit_back"
 PROF_CB_UPDATE = "prof:update"
 PROF_CB_CHECK = "prof:check"
+AO_CB_REFRESH = "ao:refresh"
+AO_CB_CANCEL_ORDER_PREFIX = "ao:cancel_order"
+AO_CB_CANCEL_STOP_PREFIX = "ao:cancel_stop"
 
 
 async def _safe_telegram_call(coro):
@@ -139,6 +142,10 @@ def _list_header(total: int, page: int, total_pages: int) -> str:
         "📈 <b>Российские акции (T-Bank)</b>\n"
         f"Всего: <b>{total}</b>\n"
         f"Страница: <b>{page}/{total_pages}</b>\n\n"
+        "Кнопки сверху:\n"
+        "• <b>Поиск</b> — найти по тикеру/FIGI/названию\n"
+        "• <b>Избранное</b> — только ваши отмеченные бумаги\n"
+        "• <b>Все</b> — полный список\n\n"
         "Выберите акцию для подробной информации:"
     )
 
@@ -375,12 +382,24 @@ async def _show_monitor_list_message(message: Message) -> None:
 
     items = payload.get("items", [])
     if not isinstance(items, list) or not items:
-        await _safe_telegram_call(message.answer("У вас пока нет мониторингов.", reply_markup=MAIN_MENU_KEYBOARD))
+        await _safe_telegram_call(
+            message.answer(
+                "🧭 <b>Мои мониторинги</b>\n"
+                "Пока ничего нет.\n\n"
+                "Создайте первый через «🔔 Новый мониторинг».",
+                reply_markup=MAIN_MENU_KEYBOARD,
+            )
+        )
         return
+
+    active_count = sum(1 for item in items if isinstance(item, dict) and bool(item.get("is_active")))
 
     await _safe_telegram_call(
         message.answer(
-            "🧭 <b>Мои мониторинги</b>\nВыберите монитор:",
+            "🧭 <b>Мои мониторинги</b>\n"
+            f"Активных: <b>{active_count}</b> из <b>{len(items)}</b>\n"
+            "🟢 — активен, ⚪ — выключен\n"
+            "Выберите монитор:",
             reply_markup=_monitor_list_keyboard(items),
         )
     )
@@ -458,12 +477,22 @@ async def _edit_monitor_list_message(callback: CallbackQuery) -> None:
 
     items = payload.get("items", [])
     if not isinstance(items, list) or not items:
-        await _safe_edit_text(callback.message, "У вас пока нет мониторингов.")
+        await _safe_edit_text(
+            callback.message,
+            "🧭 <b>Мои мониторинги</b>\n"
+            "Пока ничего нет.\n\n"
+            "Создайте первый через «🔔 Новый мониторинг».",
+        )
         return
+
+    active_count = sum(1 for item in items if isinstance(item, dict) and bool(item.get("is_active")))
 
     await _safe_edit_text(
         callback.message,
-        "🧭 <b>Мои мониторинги</b>\nВыберите монитор:",
+        "🧭 <b>Мои мониторинги</b>\n"
+        f"Активных: <b>{active_count}</b> из <b>{len(items)}</b>\n"
+        "🟢 — активен, ⚪ — выключен\n"
+        "Выберите монитор:",
         reply_markup=_monitor_list_keyboard(items),
     )
     return
@@ -530,6 +559,36 @@ def _direction_map(label: str) -> str | None:
         "": "ORDER_DIRECTION_BUY",
         "": "ORDER_DIRECTION_SELL",
     }.get(label)
+
+
+def _order_type_help_text() -> str:
+    return (
+        "🧾 <b>Новая заявка</b>\n"
+        "Выберите тип:\n"
+        f"• <b>{ORDER_TYPE_LIMIT_LABEL}</b> — вы задаете цену, исполнение только по ней или лучше.\n"
+        f"• <b>{ORDER_TYPE_MARKET_LABEL}</b> — быстрое исполнение по текущей рыночной цене.\n"
+        f"• <b>{ORDER_TYPE_BESTPRICE_LABEL}</b> — исполнение по лучшей доступной цене в стакане.\n\n"
+        "Если важна точная цена — лимитная.\n"
+        "Если важна скорость — рыночная/лучшая цена."
+    )
+
+
+def _stop_type_help_text() -> str:
+    return (
+        "🛑 <b>Новый стоп-приказ</b>\n"
+        "Выберите тип:\n"
+        f"• <b>{STOP_KIND_STOP_LOSS_LABEL}</b> — защита от убытка, при срабатывании отправляет рыночную заявку.\n"
+        f"• <b>{STOP_KIND_STOP_LOSS_LIMIT_LABEL}</b> — защита от убытка, при срабатывании ставит лимитную заявку.\n"
+        f"• <b>{STOP_KIND_TAKE_PROFIT_LABEL}</b> — фиксация прибыли по целевой цене."
+    )
+
+
+def _direction_help_text() -> str:
+    return (
+        "Выберите направление:\n"
+        f"• <b>{DIRECTION_BUY_LABEL}</b> — открыть/увеличить длинную позицию.\n"
+        f"• <b>{DIRECTION_SELL_LABEL}</b> — сократить/закрыть позицию (или открыть шорт, если доступно)."
+    )
 
 
 async def _load_items(state: FSMContext, force_refresh: bool = False) -> list[ShareViewItem]:
@@ -824,14 +883,16 @@ async def profile_start(message: Message, state: FSMContext) -> None:
     configured = bool(status.get("configured"))
     account_id = status.get("tbank_account_id")
     account_text = account_id if account_id else "—"
-    status_text = "Настроен" if configured else "Не настроен"
+    status_text = "✅ Настроен" if configured else "⚠️ Не настроен"
     await _safe_telegram_call(
         message.answer(
             "🔐 <b>Профиль T-Bank</b>\n"
-            f"Статус: <b>{status_text}</b>\n"
+            f"Подключение: <b>{status_text}</b>\n"
             f"Telegram ID: <code>{message.from_user.id}</code>\n"
-            f"Account ID: <code>{account_text}</code>\n\n"
-            "Выберите действие:",
+            f"Account ID: <code>{html.escape(str(account_text))}</code>\n\n"
+            "Управление доступом:\n"
+            "• <b>Обновить токен/account_id</b> — заменить реквизиты API.\n"
+            "• <b>Проверить доступ</b> — быстрый тест подключения и прав.",
             reply_markup=_profile_keyboard(),
         )
     )
@@ -866,7 +927,12 @@ async def profile_update_callback(callback: CallbackQuery, state: FSMContext) ->
     await _safe_telegram_call(callback.answer())
     await state.set_state(SharesBrowserStates.profile_set_token)
     if callback.message:
-        prompt = await _safe_telegram_call(callback.message.answer("Введите T-Bank API token:"))
+        prompt = await _safe_telegram_call(
+            callback.message.answer(
+                "Введите <b>T-Bank API token</b>:\n"
+                "Сообщение будет удалено после обработки для безопасности."
+            )
+        )
         await state.update_data(profile_prompt_message_id=(prompt.message_id if prompt else None))
 
 
@@ -931,7 +997,12 @@ async def profile_set_token(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(profile_token=token)
     await state.set_state(SharesBrowserStates.profile_set_account_id)
-    prompt = await _safe_telegram_call(message.answer("Введите account_id из T-Bank Invest:"))
+    prompt = await _safe_telegram_call(
+        message.answer(
+            "Введите <b>account_id</b> из T-Bank Invest:\n"
+            "Это идентификатор брокерского счета, к которому будут отправляться заявки."
+        )
+    )
     await state.update_data(profile_prompt_message_id=(prompt.message_id if prompt else None))
     return
 
@@ -1009,7 +1080,14 @@ async def profile_set_account_id(message: Message, state: FSMContext) -> None:
 @router.message(F.text == "  ")
 async def monitor_start(message: Message, state: FSMContext) -> None:
     await state.set_state(SharesBrowserStates.monitoring_select_company)
-    await _safe_telegram_call(message.answer("Введите тикер или FIGI инструмента:"))
+    await _safe_telegram_call(
+        message.answer(
+            "🔔 <b>Новый мониторинг</b>\n"
+            "Мониторинг отслеживает движение цены и присылает уведомления.\n\n"
+            "Шаг 1/4: введите тикер или FIGI инструмента.\n"
+            "Примеры: <code>SBER</code>, <code>BBG004730N88</code>."
+        )
+    )
     return
 
     await state.set_state(SharesBrowserStates.monitoring_select_company)
@@ -1034,7 +1112,13 @@ async def monitor_set_company(message: Message, state: FSMContext) -> None:
         monitor_base_price=share.last_price,
     )
     await state.set_state(SharesBrowserStates.monitoring_set_interval)
-    await _safe_telegram_call(message.answer("Введите интервал проверки в минутах (например, 5):"))
+    await _safe_telegram_call(
+        message.answer(
+            "Шаг 2/4: введите интервал проверки в минутах.\n"
+            "Чем меньше значение, тем быстрее реакция, но больше запросов.\n"
+            "Пример: <code>5</code>."
+        )
+    )
     return
 
     if not message.text:
@@ -1070,7 +1154,13 @@ async def monitor_set_interval(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(monitor_interval=minutes)
     await state.set_state(SharesBrowserStates.monitoring_set_threshold_percent)
-    await _safe_telegram_call(message.answer("Введите порог в процентах (например, 5):"))
+    await _safe_telegram_call(
+        message.answer(
+            "Шаг 3/4: введите порог в процентах.\n"
+            "Уведомление придет, если цена изменится на этот процент от базовой.\n"
+            "Пример: <code>5</code>."
+        )
+    )
 
 
 @router.message(SharesBrowserStates.monitoring_set_threshold_percent)
@@ -1087,7 +1177,13 @@ async def monitor_set_percent(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(monitor_percent=message.text.replace(",", ".").strip())
     await state.set_state(SharesBrowserStates.monitoring_set_threshold_rub)
-    await _safe_telegram_call(message.answer("Введите порог в RUB (например, 100):"))
+    await _safe_telegram_call(
+        message.answer(
+            "Шаг 4/4: введите порог в RUB.\n"
+            "Уведомление также придет, если изменение превысит эту сумму.\n"
+            "Пример: <code>100</code>."
+        )
+    )
 
 
 @router.message(SharesBrowserStates.monitoring_set_threshold_rub)
@@ -1570,7 +1666,13 @@ async def operations_start(message: Message, state: FSMContext) -> None:
     if not await _ensure_user_credentials(message):
         return
     await state.set_state(SharesBrowserStates.operations_set_days)
-    await _safe_telegram_call(message.answer("За сколько дней показать операции? (1..365, например 30)"))
+    await _safe_telegram_call(
+        message.answer(
+            "🕘 <b>Операции</b>\n"
+            "За сколько дней показать историю?\n"
+            "Введите число от <b>1</b> до <b>365</b> (например: <code>30</code>)."
+        )
+    )
 
 
 @router.message(SharesBrowserStates.operations_set_days)
@@ -1610,7 +1712,7 @@ async def order_start(message: Message, state: FSMContext) -> None:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await _safe_telegram_call(message.answer("Выберите тип заявки:", reply_markup=kb))
+    await _safe_telegram_call(message.answer(_order_type_help_text(), reply_markup=kb))
     return
 
     if not await _ensure_user_credentials(message):
@@ -1630,11 +1732,23 @@ async def order_select_type(message: Message, state: FSMContext) -> None:
         return
     mapped = _order_type_map(message.text.strip())
     if not mapped:
-        await _safe_telegram_call(message.answer("Выберите тип заявки кнопкой на клавиатуре."))
+        await _safe_telegram_call(
+            message.answer(
+                "Выберите тип заявки кнопкой на клавиатуре:\n"
+                f"• <b>{ORDER_TYPE_LIMIT_LABEL}</b>\n"
+                f"• <b>{ORDER_TYPE_MARKET_LABEL}</b>\n"
+                f"• <b>{ORDER_TYPE_BESTPRICE_LABEL}</b>"
+            )
+        )
         return
     await state.update_data(order_type=mapped)
     await state.set_state(SharesBrowserStates.order_select_figi)
-    await _safe_telegram_call(message.answer("Введите тикер или FIGI (или Отмена):"))
+    await _safe_telegram_call(
+        message.answer(
+            "Введите тикер или FIGI инструмента (или Отмена).\n"
+            "Примеры: <code>SBER</code>, <code>BBG004730N88</code>."
+        )
+    )
 
 
 @router.message(SharesBrowserStates.order_select_figi)
@@ -1655,7 +1769,7 @@ async def order_select_figi(message: Message, state: FSMContext) -> None:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await _safe_telegram_call(message.answer("Выберите направление:", reply_markup=kb))
+    await _safe_telegram_call(message.answer(_direction_help_text(), reply_markup=kb))
 
 
 @router.message(SharesBrowserStates.order_select_direction)
@@ -1664,11 +1778,16 @@ async def order_select_direction(message: Message, state: FSMContext) -> None:
         return
     direction = _direction_map(message.text.strip())
     if not direction:
-        await _safe_telegram_call(message.answer("Выберите направление кнопкой на клавиатуре."))
+        await _safe_telegram_call(message.answer(_direction_help_text()))
         return
     await state.update_data(order_direction=direction)
     await state.set_state(SharesBrowserStates.order_set_quantity)
-    await _safe_telegram_call(message.answer("Введите количество лотов (или Отмена):"))
+    await _safe_telegram_call(
+        message.answer(
+            "Введите количество <b>лотов</b> (или Отмена).\n"
+            "Важно: вводится число лотов, не количество штук."
+        )
+    )
 
 
 @router.message(SharesBrowserStates.order_set_quantity)
@@ -1684,7 +1803,12 @@ async def order_set_quantity(message: Message, state: FSMContext) -> None:
     await state.update_data(order_quantity=quantity)
     if data.get("order_type") == "ORDER_TYPE_LIMIT":
         await state.set_state(SharesBrowserStates.order_set_price)
-        await _safe_telegram_call(message.answer("Введите цену заявки (или Отмена):"))
+        await _safe_telegram_call(
+            message.answer(
+                "Введите цену заявки (или Отмена).\n"
+                "Это цена за 1 бумагу, по которой лимитная заявка будет стоять в стакане."
+            )
+        )
         return
     await _submit_order(message, state, None)
 
@@ -1742,7 +1866,7 @@ async def stop_start(message: Message, state: FSMContext) -> None:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await _safe_telegram_call(message.answer("Выберите тип стоп-приказа:", reply_markup=kb))
+    await _safe_telegram_call(message.answer(_stop_type_help_text(), reply_markup=kb))
     return
 
     if not await _ensure_user_credentials(message):
@@ -1762,11 +1886,16 @@ async def stop_select_type(message: Message, state: FSMContext) -> None:
         return
     mapped = _stop_type_map(message.text.strip())
     if not mapped:
-        await _safe_telegram_call(message.answer("Выберите тип стоп-приказа кнопкой на клавиатуре."))
+        await _safe_telegram_call(message.answer(_stop_type_help_text()))
         return
     await state.update_data(stop_kind=message.text.strip(), stop_order_type=mapped)
     await state.set_state(SharesBrowserStates.stop_select_figi)
-    await _safe_telegram_call(message.answer("Введите тикер или FIGI (или Отмена):"))
+    await _safe_telegram_call(
+        message.answer(
+            "Введите тикер или FIGI инструмента (или Отмена).\n"
+            "Примеры: <code>GAZP</code>, <code>BBG004730RP0</code>."
+        )
+    )
 
 
 @router.message(SharesBrowserStates.stop_select_figi)
@@ -1787,7 +1916,14 @@ async def stop_select_figi(message: Message, state: FSMContext) -> None:
         resize_keyboard=True,
         one_time_keyboard=True,
     )
-    await _safe_telegram_call(message.answer("Выберите направление:", reply_markup=kb))
+    await _safe_telegram_call(
+        message.answer(
+            "Выберите направление для стоп-приказа:\n"
+            f"• <b>{DIRECTION_BUY_LABEL}</b> — срабатывание на покупку.\n"
+            f"• <b>{DIRECTION_SELL_LABEL}</b> — срабатывание на продажу.",
+            reply_markup=kb,
+        )
+    )
 
 
 @router.message(SharesBrowserStates.stop_select_direction)
@@ -1796,11 +1932,22 @@ async def stop_select_direction(message: Message, state: FSMContext) -> None:
         return
     direction = _direction_map(message.text.strip())
     if not direction:
-        await _safe_telegram_call(message.answer("Выберите направление кнопкой на клавиатуре."))
+        await _safe_telegram_call(
+            message.answer(
+                "Выберите направление кнопкой:\n"
+                f"• <b>{DIRECTION_BUY_LABEL}</b>\n"
+                f"• <b>{DIRECTION_SELL_LABEL}</b>"
+            )
+        )
         return
     await state.update_data(stop_direction=direction)
     await state.set_state(SharesBrowserStates.stop_set_quantity)
-    await _safe_telegram_call(message.answer("Введите количество лотов (или Отмена):"))
+    await _safe_telegram_call(
+        message.answer(
+            "Введите количество <b>лотов</b> для стоп-приказа (или Отмена).\n"
+            "Указывайте объем, который нужно защитить/зафиксировать."
+        )
+    )
 
 
 @router.message(SharesBrowserStates.stop_set_quantity)
@@ -1814,7 +1961,12 @@ async def stop_set_quantity(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(stop_quantity=quantity)
     await state.set_state(SharesBrowserStates.stop_set_stop_price)
-    await _safe_telegram_call(message.answer("Введите стоп-цену (или Отмена):"))
+    await _safe_telegram_call(
+        message.answer(
+            "Введите <b>стоп-цену</b> (или Отмена).\n"
+            "При достижении этой цены активируется стоп-приказ."
+        )
+    )
 
 
 @router.message(SharesBrowserStates.stop_set_stop_price)
@@ -1830,7 +1982,13 @@ async def stop_set_stop_price(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if data.get("stop_kind") in {STOP_KIND_STOP_LOSS_LIMIT_LABEL, STOP_KIND_TAKE_PROFIT_LABEL}:
         await state.set_state(SharesBrowserStates.stop_set_limit_price)
-        await _safe_telegram_call(message.answer("Введите лимитную цену (или '-' для рыночного исполнения, или Отмена):"))
+        await _safe_telegram_call(
+            message.answer(
+                "Введите <b>лимитную цену</b> исполнения.\n"
+                "Если хотите рыночное исполнение после срабатывания — введите <code>-</code>.\n"
+                "Или нажмите Отмена."
+            )
+        )
         return
     await _submit_stop_order(message, state, None)
 
@@ -1906,46 +2064,194 @@ async def open_active_orders(message: Message) -> None:
     except RuntimeError as exc:
         await _safe_telegram_call(message.answer(f"Не удалось получить активные заявки: {exc}"))
         return
+    orders_details = orders.get("details", {})
+    stop_orders_details = stop_orders.get("details", {})
+    active_orders, active_stops = _extract_active_orders_lists(orders_details, stop_orders_details)
     await _safe_telegram_call(
         message.answer(
             _render_active_orders(
-                orders_details=orders.get("details", {}),
-                stop_orders_details=stop_orders.get("details", {}),
-            )
+                orders_details=orders_details,
+                stop_orders_details=stop_orders_details,
+            ),
+            reply_markup=_active_orders_keyboard(active_orders, active_stops),
         )
+    )
+
+
+@router.callback_query(F.data == AO_CB_REFRESH)
+async def active_orders_refresh_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    await _safe_telegram_call(callback.answer("Обновляю..."))
+    try:
+        orders = await service.get_orders(callback.from_user.id)
+        stop_orders = await service.get_stop_orders(callback.from_user.id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.message.answer(f"Не удалось получить активные заявки: {exc}"))
+        return
+    orders_details = orders.get("details", {})
+    stop_orders_details = stop_orders.get("details", {})
+    active_orders, active_stops = _extract_active_orders_lists(orders_details, stop_orders_details)
+    await _safe_edit_text(
+        callback.message,
+        _render_active_orders(
+            orders_details=orders_details,
+            stop_orders_details=stop_orders_details,
+        ),
+        reply_markup=_active_orders_keyboard(active_orders, active_stops),
+    )
+
+
+@router.callback_query(F.data.startswith(f"{AO_CB_CANCEL_ORDER_PREFIX}:"))
+async def active_orders_cancel_order_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message or not callback.data:
+        return
+    raw_index = callback.data.split(":", maxsplit=2)[-1]
+    if not raw_index.isdigit() or int(raw_index) < 1:
+        await _safe_telegram_call(callback.answer("Некорректный номер заявки", show_alert=True))
+        return
+    target_index = int(raw_index)
+
+    await _safe_telegram_call(callback.answer("Отменяю биржевую заявку..."))
+    try:
+        orders = await service.get_orders(callback.from_user.id)
+        stop_orders = await service.get_stop_orders(callback.from_user.id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.message.answer(f"Не удалось получить активные заявки: {exc}"))
+        return
+
+    orders_details = orders.get("details", {})
+    stop_orders_details = stop_orders.get("details", {})
+    active_orders, active_stops = _extract_active_orders_lists(orders_details, stop_orders_details)
+    if target_index > len(active_orders):
+        await _safe_telegram_call(callback.answer("Эта заявка уже не активна", show_alert=True))
+        await _safe_edit_text(
+            callback.message,
+            _render_active_orders(orders_details=orders_details, stop_orders_details=stop_orders_details),
+            reply_markup=_active_orders_keyboard(active_orders, active_stops),
+        )
+        return
+
+    selected = active_orders[target_index - 1]
+    order_id = str(selected.get("orderId") or selected.get("order_id") or "").strip()
+    if not order_id:
+        await _safe_telegram_call(callback.answer("Не удалось определить ID заявки", show_alert=True))
+        return
+
+    try:
+        await service.cancel_order(callback.from_user.id, order_id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.answer(f"Не удалось отменить заявку: {exc}", show_alert=True))
+        return
+
+    await _safe_telegram_call(callback.answer("Биржевая заявка отменена"))
+    try:
+        refreshed_orders = await service.get_orders(callback.from_user.id)
+        refreshed_stop_orders = await service.get_stop_orders(callback.from_user.id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.message.answer(f"Заявка отменена, но обновить список не удалось: {exc}"))
+        return
+
+    refreshed_orders_details = refreshed_orders.get("details", {})
+    refreshed_stop_orders_details = refreshed_stop_orders.get("details", {})
+    refreshed_active_orders, refreshed_active_stops = _extract_active_orders_lists(
+        refreshed_orders_details,
+        refreshed_stop_orders_details,
+    )
+    await _safe_edit_text(
+        callback.message,
+        _render_active_orders(
+            orders_details=refreshed_orders_details,
+            stop_orders_details=refreshed_stop_orders_details,
+        ),
+        reply_markup=_active_orders_keyboard(refreshed_active_orders, refreshed_active_stops),
+    )
+
+
+@router.callback_query(F.data.startswith(f"{AO_CB_CANCEL_STOP_PREFIX}:"))
+async def active_orders_cancel_stop_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message or not callback.data:
+        return
+    raw_index = callback.data.split(":", maxsplit=2)[-1]
+    if not raw_index.isdigit() or int(raw_index) < 1:
+        await _safe_telegram_call(callback.answer("Некорректный номер стоп-приказа", show_alert=True))
+        return
+    target_index = int(raw_index)
+
+    await _safe_telegram_call(callback.answer("Отменяю стоп-приказ..."))
+    try:
+        orders = await service.get_orders(callback.from_user.id)
+        stop_orders = await service.get_stop_orders(callback.from_user.id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.message.answer(f"Не удалось получить активные заявки: {exc}"))
+        return
+
+    orders_details = orders.get("details", {})
+    stop_orders_details = stop_orders.get("details", {})
+    active_orders, active_stops = _extract_active_orders_lists(orders_details, stop_orders_details)
+    if target_index > len(active_stops):
+        await _safe_telegram_call(callback.answer("Этот стоп-приказ уже не активен", show_alert=True))
+        await _safe_edit_text(
+            callback.message,
+            _render_active_orders(orders_details=orders_details, stop_orders_details=stop_orders_details),
+            reply_markup=_active_orders_keyboard(active_orders, active_stops),
+        )
+        return
+
+    selected = active_stops[target_index - 1]
+    stop_order_id = str(selected.get("stopOrderId") or selected.get("stop_order_id") or "").strip()
+    if not stop_order_id:
+        await _safe_telegram_call(callback.answer("Не удалось определить ID стоп-приказа", show_alert=True))
+        return
+
+    try:
+        await service.cancel_stop_order(callback.from_user.id, stop_order_id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.answer(f"Не удалось отменить стоп-приказ: {exc}", show_alert=True))
+        return
+
+    await _safe_telegram_call(callback.answer("Стоп-приказ отменен"))
+    try:
+        refreshed_orders = await service.get_orders(callback.from_user.id)
+        refreshed_stop_orders = await service.get_stop_orders(callback.from_user.id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.message.answer(f"Стоп-приказ отменен, но обновить список не удалось: {exc}"))
+        return
+
+    refreshed_orders_details = refreshed_orders.get("details", {})
+    refreshed_stop_orders_details = refreshed_stop_orders.get("details", {})
+    refreshed_active_orders, refreshed_active_stops = _extract_active_orders_lists(
+        refreshed_orders_details,
+        refreshed_stop_orders_details,
+    )
+    await _safe_edit_text(
+        callback.message,
+        _render_active_orders(
+            orders_details=refreshed_orders_details,
+            stop_orders_details=refreshed_stop_orders_details,
+        ),
+        reply_markup=_active_orders_keyboard(refreshed_active_orders, refreshed_active_stops),
     )
 
 
 @router.message(Command("cancel_order"))
 async def cancel_order_cmd(message: Message) -> None:
-    if not message.text or not message.from_user:
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await _safe_telegram_call(message.answer(": /cancel_order ORDER_ID"))
-        return
-    try:
-        result = await service.cancel_order(message.from_user.id, parts[1].strip())
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось отменить заявку: {exc}"))
-        return
-    await _safe_telegram_call(message.answer("  \n<code>" + _format_json_short(result.get("details", {}), 1200) + "</code>"))
+    await _safe_telegram_call(
+        message.answer(
+            "Команды для отмены больше не используются.\n"
+            "Откройте «📂 Активные заявки» и нажмите кнопку отмены у нужной заявки."
+        )
+    )
 
 
 @router.message(Command("cancel_stop"))
 async def cancel_stop_cmd(message: Message) -> None:
-    if not message.text or not message.from_user:
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await _safe_telegram_call(message.answer(": /cancel_stop STOP_ORDER_ID"))
-        return
-    try:
-        result = await service.cancel_stop_order(message.from_user.id, parts[1].strip())
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось отменить стоп-приказ: {exc}"))
-        return
-    await _safe_telegram_call(message.answer(" - \n<code>" + _format_json_short(result.get("details", {}), 1200) + "</code>"))
+    await _safe_telegram_call(
+        message.answer(
+            "Команды для отмены больше не используются.\n"
+            "Откройте «📂 Активные заявки» и нажмите кнопку отмены у нужного стоп-приказа."
+        )
+    )
 
 
 
@@ -2417,7 +2723,7 @@ _share_details_text = _share_details_text_legacy
 
 def _render_portfolio(details: dict) -> str:
     if not isinstance(details, dict):
-        return "💼 <b>Портфель</b>\nНет данных по портфелю."
+        return "💼 <b>Портфель T-Bank</b>\nДанные портфеля пока недоступны."
 
     total_shares = _money_from_quotation(details.get("totalAmountShares"))
     total_bonds = _money_from_quotation(details.get("totalAmountBonds"))
@@ -2433,12 +2739,14 @@ def _render_portfolio(details: dict) -> str:
         + (total_curr or Decimal("0"))
         + (total_futures or Decimal("0"))
     )
+    pl_badge = "🟢" if (expected_yield or Decimal("0")) > 0 else "🔴" if (expected_yield or Decimal("0")) < 0 else "⚪"
+    pl_text = f"{_format_decimal_human(expected_yield)} {currency}" if expected_yield is not None else "—"
     lines = [
         "💼 <b>Портфель T-Bank</b>",
-        f"Общая стоимость: <b>{_format_decimal_human(total_all)} {currency}</b>",
-        f"Ожидаемый P/L: <b>{_format_decimal_human(expected_yield)} {currency}</b>",
+        f"Итого: <b>{_format_decimal_human(total_all)} {currency}</b>",
+        f"{pl_badge} P/L: <b>{pl_text}</b>",
         "",
-        "Состав:",
+        "📦 <b>Структура</b>",
         f"• Акции: <b>{_format_decimal_human(total_shares)} {currency}</b>",
         f"• Облигации: <b>{_format_decimal_human(total_bonds)} {currency}</b>",
         f"• Фонды: <b>{_format_decimal_human(total_etf)} {currency}</b>",
@@ -2448,11 +2756,12 @@ def _render_portfolio(details: dict) -> str:
     positions = details.get("positions")
     if not isinstance(positions, list) or not positions:
         lines.append("")
-        lines.append("Позиции: нет")
+        lines.append("🧾 <b>Позиции</b>")
+        lines.append("Открытых позиций пока нет.")
         return "\n".join(lines)
 
     lines.append("")
-    lines.append(f"Позиции ({len(positions)}):")
+    lines.append(f"🧾 <b>Позиции ({len(positions)})</b>")
     for i, pos in enumerate(positions[:12], start=1):
         if not isinstance(pos, dict):
             continue
@@ -2460,17 +2769,23 @@ def _render_portfolio(details: dict) -> str:
         instrument_type = str(pos.get("instrumentType") or "unknown")
         quantity_lots = _format_decimal_plain(_money_from_quotation(pos.get("quantityLots")))
         quantity_total = _format_decimal_plain(_money_from_quotation(pos.get("quantity")))
-        avg_price = _format_money(pos.get("averagePositionPrice"))
-        current_price = _format_money(pos.get("currentPrice"))
-        pos_yield = _format_money(pos.get("expectedYield"), fallback_currency="")
+        pos_currency = _extract_currency(pos.get("currentPrice"), currency)
+        avg_price = _format_money(pos.get("averagePositionPrice"), fallback_currency=pos_currency)
+        current_price = _format_money(pos.get("currentPrice"), fallback_currency=pos_currency)
+        pos_yield_raw = pos.get("expectedYield")
+        pos_yield = _format_money(pos_yield_raw, fallback_currency=pos_currency)
+        pos_yield_dec = _decimal_from_any(pos_yield_raw)
+        pos_yield_badge = "🟢" if (pos_yield_dec or Decimal("0")) > 0 else "🔴" if (pos_yield_dec or Decimal("0")) < 0 else "⚪"
         blocked = bool(pos.get("blocked"))
         blocked_lots = _format_decimal_plain(_money_from_quotation(pos.get("blockedLots")))
         lines.append(f"{i}. <b>{html.escape(ticker)}</b> · {html.escape(instrument_type)}")
-        lines.append(f"   Лоты: <b>{quantity_lots}</b> | Количество: <b>{quantity_total}</b>")
-        lines.append(f"   Средняя: <b>{avg_price}</b>")
-        lines.append(f"   Текущая: <b>{current_price}</b>")
-        lines.append(f"   P/L: <b>{pos_yield}</b>")
-        lines.append(f"   Блок: <b>{'Да' if blocked else 'Нет'}</b> (лоты: <b>{blocked_lots}</b>)")
+        lines.append(f"   Лоты/шт: <b>{quantity_lots}</b> / <b>{quantity_total}</b>")
+        lines.append(f"   Средняя → Текущая: <b>{avg_price}</b> → <b>{current_price}</b>")
+        lines.append(f"   {pos_yield_badge} P/L: <b>{pos_yield}</b>")
+        lines.append(f"   Блокировка: <b>{'Да' if blocked else 'Нет'}</b> (лотов: <b>{blocked_lots}</b>)")
+    if len(positions) > 12:
+        lines.append("")
+        lines.append(f"Показаны первые <b>12</b> из <b>{len(positions)}</b> позиций.")
     return "\n".join(lines)
 
     if not isinstance(details, dict):
@@ -2532,17 +2847,17 @@ def _render_portfolio(details: dict) -> str:
 
 def _render_operations(details: dict, days: int) -> str:
     if not isinstance(details, dict):
-        return "🕘 <b>Операции</b>\nНет данных по операциям."
+        return "🕘 <b>Операции</b>\nДанные по операциям пока недоступны."
     operations = details.get("operations")
     if not isinstance(operations, list):
-        return "🕘 <b>Операции</b>\nНет данных по операциям."
+        return "🕘 <b>Операции</b>\nДанные по операциям пока недоступны."
 
     total_in = Decimal("0")
     total_out = Decimal("0")
     for op in operations:
         if not isinstance(op, dict):
             continue
-        payment_dec = _money_from_quotation(op.get("payment"))
+        payment_dec = _decimal_from_any(op.get("payment"))
         if payment_dec is None:
             continue
         if payment_dec >= 0:
@@ -2552,12 +2867,13 @@ def _render_operations(details: dict, days: int) -> str:
 
     lines = [
         f"🕘 <b>Операции за {days} дн.</b>",
-        f"Всего: <b>{len(operations)}</b> | Вход: <b>{_format_decimal_human(total_in)} RUB</b> | Выход: <b>{_format_decimal_human(total_out)} RUB</b>",
+        f"Всего: <b>{len(operations)}</b> · Вход: <b>{_format_decimal_human(total_in)} RUB</b> · Выход: <b>{_format_decimal_human(total_out)} RUB</b>",
         "",
     ]
     if not operations:
-        lines.append("Операций не найдено.")
+        lines.append("За выбранный период операций не найдено.")
         return "\n".join(lines)
+
     for i, op in enumerate(operations[:20], start=1):
         if not isinstance(op, dict):
             continue
@@ -2568,20 +2884,30 @@ def _render_operations(details: dict, days: int) -> str:
         except Exception:
             pass
         op_type = str(op.get("type") or op.get("operationType") or "UNKNOWN")
+        op_type_human = op_type.replace("_", " ").strip() or "UNKNOWN"
         ticker = str(op.get("ticker") or op.get("figi") or "—")
-        payment = _format_money(op.get("payment"), fallback_currency="")
+        payment_raw = op.get("payment")
+        payment_dec = _decimal_from_any(payment_raw)
+        if isinstance(payment_raw, dict):
+            payment = _format_money(payment_raw, fallback_currency="RUB")
+        elif payment_dec is not None:
+            payment = f"{_format_decimal_human(payment_dec)} RUB"
+        else:
+            payment = "—"
+        flow_badge = "🟢" if (payment_dec or Decimal("0")) > 0 else "🔴" if (payment_dec or Decimal("0")) < 0 else "⚪"
         quantity = (
             _decimal_from_any(op.get("quantity"))
             or _decimal_from_any(op.get("quantityExecuted"))
             or _decimal_from_any(op.get("quantityLots"))
         )
         quantity_text = _format_decimal_human(quantity, decimals=6) if quantity is not None else "—"
-        lines.append(f"{i}. <b>{html.escape(op_type)}</b>")
-        lines.append(f"   Инструмент: <b>{html.escape(ticker)}</b>")
-        lines.append(f"   Дата: <b>{html.escape(dt)}</b>")
+        lines.append(f"{i}. <b>{html.escape(op_type_human)}</b> · <code>{html.escape(ticker)}</code>")
+        lines.append(f"   {flow_badge} Сумма: <b>{html.escape(payment)}</b>")
         lines.append(f"   Количество: <b>{html.escape(quantity_text)}</b>")
-        lines.append(f"   Сумма: <b>{html.escape(payment)}</b>")
+        lines.append(f"   Дата: <b>{html.escape(dt)}</b>")
         lines.append("")
+    if len(operations) > 20:
+        lines.append(f"Показаны первые <b>20</b> из <b>{len(operations)}</b> операций.")
     return "\n".join(lines)
 
     if not isinstance(details, dict):
@@ -2634,84 +2960,81 @@ def _render_operations(details: dict, days: int) -> str:
     return "\n".join(lines)
 
 
-def _render_active_orders(orders_details: dict, stop_orders_details: dict) -> str:
+def _extract_active_orders_lists(orders_details: dict, stop_orders_details: dict) -> tuple[list[dict], list[dict]]:
     orders = orders_details.get("orders", []) if isinstance(orders_details, dict) else []
     stops = stop_orders_details.get("stopOrders", []) if isinstance(stop_orders_details, dict) else []
-    if not isinstance(orders, list):
-        orders = []
-    if not isinstance(stops, list):
-        stops = []
+    safe_orders = [item for item in orders if isinstance(item, dict)] if isinstance(orders, list) else []
+    safe_stops = [item for item in stops if isinstance(item, dict)] if isinstance(stops, list) else []
+    return safe_orders, safe_stops
+
+
+def _active_orders_keyboard(orders: list[dict], stops: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for i, order in enumerate(orders[:10], start=1):
+        figi = str(order.get("figi") or order.get("instrumentId") or order.get("instrumentUid") or "—")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"❌ Отменить биржевую #{i} · {figi}",
+                    callback_data=f"{AO_CB_CANCEL_ORDER_PREFIX}:{i}",
+                )
+            ]
+        )
+
+    for i, stop in enumerate(stops[:10], start=1):
+        figi = str(stop.get("figi") or stop.get("instrumentId") or stop.get("instrumentUid") or "—")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🛑 Отменить стоп #{i} · {figi}",
+                    callback_data=f"{AO_CB_CANCEL_STOP_PREFIX}:{i}",
+                )
+            ]
+        )
+
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=AO_CB_REFRESH)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _render_active_orders(orders_details: dict, stop_orders_details: dict) -> str:
+    orders, stops = _extract_active_orders_lists(orders_details, stop_orders_details)
 
     lines = [
         "📂 <b>Активные заявки</b>",
-        f"Биржевые заявки: <b>{len(orders)}</b>",
-        f"Стоп-приказы: <b>{len(stops)}</b>",
+        f"Биржевые: <b>{len(orders)}</b> · Стоп-приказы: <b>{len(stops)}</b>",
+        "Для отмены нажмите кнопку с тем же номером заявки ниже.",
         "",
     ]
     if not orders:
-        lines.append("Биржевых заявок нет.")
+        lines.append("Биржевых заявок сейчас нет.")
     else:
-        lines.append("Биржевые заявки:")
-        for i, order in enumerate(orders, start=1):
-            if not isinstance(order, dict):
-                continue
+        lines.append("📈 <b>Биржевые заявки</b>")
+        for i, order in enumerate(orders[:10], start=1):
             order_id = str(order.get("orderId") or order.get("order_id") or "—")
             figi = str(order.get("figi") or order.get("instrumentId") or order.get("instrumentUid") or "—")
-            lines.append(f"{i}. ID: <code>{html.escape(order_id)}</code> | FIGI: <b>{html.escape(figi)}</b>")
-    lines.append("")
-    if not stops:
-        lines.append("Стоп-приказов нет.")
-    else:
-        lines.append("Стоп-приказы:")
-        for i, stop in enumerate(stops, start=1):
-            if not isinstance(stop, dict):
-                continue
-            stop_id = str(stop.get("stopOrderId") or stop.get("stop_order_id") or "—")
-            figi = str(stop.get("figi") or stop.get("instrumentId") or stop.get("instrumentUid") or "—")
-            lines.append(f"{i}. ID: <code>{html.escape(stop_id)}</code> | FIGI: <b>{html.escape(figi)}</b>")
-    lines.append("")
-    lines.append("Отмена:")
-    lines.append("<code>/cancel_order ORDER_ID</code>")
-    lines.append("<code>/cancel_stop STOP_ORDER_ID</code>")
-    return "\n".join(lines)
+            lines.append(f"{i}. FIGI: <code>{html.escape(figi)}</code>")
+            lines.append(f"   ID: <code>{html.escape(order_id)}</code>")
 
-    orders = orders_details.get("orders", []) if isinstance(orders_details, dict) else []
-    stops = stop_orders_details.get("stopOrders", []) if isinstance(stop_orders_details, dict) else []
-    if not isinstance(orders, list):
-        orders = []
-    if not isinstance(stops, list):
-        stops = []
-    lines = [
-        " <b> </b>",
-        f"Биржевые заявки: <b>{len(orders)}</b>",
-        f"Стоп-приказы: <b>{len(stops)}</b>",
-        "",
-    ]
-    if not orders:
-        lines.append(" .")
-    else:
-        lines.append(":")
-        for i, order in enumerate(orders, start=1):
-            if not isinstance(order, dict):
-                continue
-            order_id = str(order.get("orderId") or order.get("order_id") or "—")
-            figi = str(order.get("figi") or order.get("instrumentId") or order.get("instrumentUid") or "—")
-            lines.append(f"{i}. ID: <code>{html.escape(order_id)}</code> | FIGI: <b>{html.escape(figi)}</b>")
     lines.append("")
     if not stops:
-        lines.append("- .")
+        lines.append("Стоп-приказов сейчас нет.")
     else:
-        lines.append("-:")
-        for i, stop in enumerate(stops, start=1):
-            if not isinstance(stop, dict):
-                continue
+        lines.append("🛑 <b>Стоп-приказы</b>")
+        for i, stop in enumerate(stops[:10], start=1):
             stop_id = str(stop.get("stopOrderId") or stop.get("stop_order_id") or "—")
             figi = str(stop.get("figi") or stop.get("instrumentId") or stop.get("instrumentUid") or "—")
-            lines.append(f"{i}. ID: <code>{html.escape(stop_id)}</code> | FIGI: <b>{html.escape(figi)}</b>")
+            lines.append(f"{i}. FIGI: <code>{html.escape(figi)}</code>")
+            lines.append(f"   ID: <code>{html.escape(stop_id)}</code>")
+
+    if len(orders) > 10 or len(stops) > 10:
+        lines.append("")
+        lines.append("Показаны первые 10 заявок каждого типа.")
+
     lines.append("")
-    lines.append(":")
-    lines.append("<code>/cancel_order ORDER_ID</code>")
-    lines.append("<code>/cancel_stop STOP_ORDER_ID</code>")
+    lines.append("Управление кнопками:")
+    lines.append("• отмена биржевой заявки")
+    lines.append("• отмена стоп-приказа")
+    lines.append("• обновление списка")
     return "\n".join(lines)
 
 
@@ -2759,7 +3082,12 @@ def _monitor_detail_text(item: dict) -> str:
         f"Порог: <b>{_to_clean_num_str(item.get('threshold_percent'), '%')}</b> или <b>{_to_clean_num_str(item.get('threshold_rub'))} RUB</b>\n"
         f"Базовая цена: <b>{_to_clean_num_str(item.get('base_price'))} RUB</b>\n"
         f"Последняя проверка: <b>{_format_datetime(str(item.get('last_checked_at_msk')) if item.get('last_checked_at_msk') else None)}</b>\n"
-        f"Последний алерт: <b>{_format_datetime(str(item.get('last_notified_at_msk')) if item.get('last_notified_at_msk') else None)}</b>"
+        f"Последний алерт: <b>{_format_datetime(str(item.get('last_notified_at_msk')) if item.get('last_notified_at_msk') else None)}</b>\n\n"
+        "Кнопки ниже:\n"
+        "• Включить/выключить монитор\n"
+        "• Изменить пороги (%) и RUB\n"
+        "• Обновить базовую цену\n"
+        "• Удалить монитор"
     )
 
     status = " " if item.get("is_active") else " "
@@ -2830,7 +3158,9 @@ def _monitor_edit_menu_text(item: dict) -> str:
         f"✏️ <b>Редактирование мониторинга #{monitor_id}</b>\n"
         f"Инструмент: <b>{html.escape(str(item.get('ticker') or item.get('figi') or '—'))}</b>\n"
         f"Текущий порог: <b>{_to_clean_num_str(item.get('threshold_percent'), '%')}</b> или <b>{_to_clean_num_str(item.get('threshold_rub'))} RUB</b>\n\n"
-        "Выберите, что изменить:"
+        "Выберите, что изменить:\n"
+        "• <b>Изменить %</b> — порог относительного изменения\n"
+        "• <b>Изменить RUB</b> — порог абсолютного изменения в рублях"
     )
 
     monitor_id = _parse_monitor_id(item.get("id")) or "—"
