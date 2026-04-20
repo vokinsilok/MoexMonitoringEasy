@@ -30,3 +30,6 @@ class ShareViewItem:
     day_close_price: str | None
     day_change_percent: str | None
     year_change_percent: str | None
+    trading_status: str | None = None
+    limit_order_available: bool | None = None
+    market_order_available: bool | None = None

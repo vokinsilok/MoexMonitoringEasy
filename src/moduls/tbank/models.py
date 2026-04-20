@@ -1,8 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Numeric, String, Text, UniqueConstraint, func
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import BigInteger, Boolean, DateTime, Numeric, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.database import Base
@@ -28,7 +27,6 @@ class TBankShare(Base):
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )
-    instrument_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
     last_synced_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -44,54 +42,6 @@ class TBankShare(Base):
         nullable=False,
         server_default=func.now(),
         onupdate=func.now(),
-    )
-
-
-class TBankSharePrice(Base):
-    __tablename__ = "tbank_share_prices"
-
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    share_id: Mapped[int] = mapped_column(
-        ForeignKey("tbank_shares.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    price: Mapped[Decimal] = mapped_column(Numeric(20, 9), nullable=False)
-    trading_open: Mapped[bool] = mapped_column(
-        Boolean,
-        nullable=False,
-        default=True,
-        server_default="true",
-    )
-    session_opened_at_msk: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=False),
-        nullable=True,
-    )
-    session_closed_at_msk: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=False),
-        nullable=True,
-    )
-    next_session_opened_at_msk: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=False),
-        nullable=True,
-    )
-    next_session_closed_at_msk: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=False),
-        nullable=True,
-    )
-    day_open_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 9), nullable=True)
-    day_close_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 9), nullable=True)
-    day_change_percent: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
-    year_change_percent: Mapped[Decimal | None] = mapped_column(Numeric(10, 4), nullable=True)
-    captured_at_msk: Mapped[datetime] = mapped_column(
-        DateTime(timezone=False),
-        nullable=False,
-        index=True,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
     )
 
 

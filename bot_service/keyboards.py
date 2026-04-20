@@ -7,6 +7,7 @@ CB_PREFIX_PAGE = "shp"
 CB_PREFIX_DETAILS = "shd"
 CB_BACK_TO_LIST = "shb"
 CB_REFRESH = "shr"
+CB_REFRESH_DETAILS = "shrd"
 CB_SEARCH = "shs"
 CB_MODE_ALL = "sha"
 CB_MODE_FAVORITES = "shf"
@@ -66,7 +67,7 @@ def share_details_keyboard(return_page: int, is_favorite: bool) -> InlineKeyboar
         inline_keyboard=[
             [InlineKeyboardButton(text=favorite_text, callback_data=f"{CB_FAVORITE_TOGGLE_PREFIX}:{int(is_favorite)}")],
             [InlineKeyboardButton(text="\u041d\u0430\u0437\u0430\u0434 \u043a \u0441\u043f\u0438\u0441\u043a\u0443", callback_data=f"{CB_BACK_TO_LIST}:{return_page}")],
-            [InlineKeyboardButton(text="\u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c", callback_data=CB_REFRESH)],
+            [InlineKeyboardButton(text="\u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c", callback_data=CB_REFRESH_DETAILS)],
         ]
     )
 

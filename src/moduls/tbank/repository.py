@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import func, insert, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.moduls.base.base import BaseRepository
@@ -8,7 +8,6 @@ from src.moduls.tbank.models import (
     TBankFavoriteShare,
     TBankPriceMonitor,
     TBankShare,
-    TBankSharePrice,
     TBankUserCredential,
 )
 
@@ -41,7 +40,6 @@ class TBankShareRepository(BaseRepository):
             "short_enabled": insert_stmt.excluded.short_enabled,
             "real_exchange": insert_stmt.excluded.real_exchange,
             "is_active": insert_stmt.excluded.is_active,
-            "instrument_payload": insert_stmt.excluded.instrument_payload,
             "last_synced_at": insert_stmt.excluded.last_synced_at,
             "updated_at": now,
         }
@@ -96,141 +94,6 @@ class TBankShareRepository(BaseRepository):
         )
         result = await self.session.execute(stmt)
         return result.scalars().first()
-
-
-class TBankSharePriceRepository(BaseRepository):
-    model = TBankSharePrice
-
-    async def create_many(self, rows: list[dict]) -> int:
-        if not rows:
-            return 0
-        await self.session.execute(insert(self.model).values(rows))
-        return len(rows)
-
-    async def touch_latest_for_share_ids(self, share_ids: list[int], values: dict) -> int:
-        unique_ids = list(dict.fromkeys([share_id for share_id in share_ids if share_id]))
-        if not unique_ids:
-            return 0
-
-        latest_ids_subquery = (
-            select(self.model.id)
-            .where(self.model.share_id.in_(unique_ids))
-            .distinct(self.model.share_id)
-            .order_by(
-                self.model.share_id.asc(),
-                self.model.captured_at_msk.desc(),
-                self.model.id.desc(),
-            )
-        )
-        update_stmt = update(self.model).where(self.model.id.in_(latest_ids_subquery)).values(**values)
-        result = await self.session.execute(update_stmt)
-        return int(result.rowcount or 0)
-
-    async def get_max_captured_at_for_share_ids(self, share_ids: list[int]) -> datetime | None:
-        unique_ids = list(dict.fromkeys([share_id for share_id in share_ids if share_id]))
-        if not unique_ids:
-            return None
-
-        stmt = select(func.max(self.model.captured_at_msk)).where(self.model.share_id.in_(unique_ids))
-        result = await self.session.execute(stmt)
-        return result.scalar_one_or_none()
-
-    async def get_first_price_since(self, share_ids: list[int], since_msk: datetime) -> dict[int, object]:
-        unique_ids = list(dict.fromkeys([share_id for share_id in share_ids if share_id]))
-        if not unique_ids:
-            return {}
-
-        stmt = (
-            select(self.model.share_id, self.model.price)
-            .where(self.model.share_id.in_(unique_ids))
-            .where(self.model.captured_at_msk >= since_msk)
-            .distinct(self.model.share_id)
-            .order_by(
-                self.model.share_id.asc(),
-                self.model.captured_at_msk.asc(),
-                self.model.id.asc(),
-            )
-        )
-        result = await self.session.execute(stmt)
-        return {share_id: price for share_id, price in result.all()}
-
-    async def get_latest_price_before(self, share_ids: list[int], before_msk: datetime) -> dict[int, object]:
-        unique_ids = list(dict.fromkeys([share_id for share_id in share_ids if share_id]))
-        if not unique_ids:
-            return {}
-
-        stmt = (
-            select(self.model.share_id, self.model.price)
-            .where(self.model.share_id.in_(unique_ids))
-            .where(self.model.captured_at_msk < before_msk)
-            .distinct(self.model.share_id)
-            .order_by(
-                self.model.share_id.asc(),
-                self.model.captured_at_msk.desc(),
-                self.model.id.desc(),
-            )
-        )
-        result = await self.session.execute(stmt)
-        return {share_id: price for share_id, price in result.all()}
-
-    async def get_latest_by_share_ids(self, share_ids: list[int]) -> dict[int, tuple[object, object, bool | None, object, object, object, object, object, object, object, object]]:
-        unique_ids = list(dict.fromkeys([share_id for share_id in share_ids if share_id]))
-        if not unique_ids:
-            return {}
-
-        latest_stmt = (
-            select(
-                self.model.share_id,
-                self.model.price,
-                self.model.captured_at_msk,
-                self.model.trading_open,
-                self.model.session_opened_at_msk,
-                self.model.session_closed_at_msk,
-                self.model.next_session_opened_at_msk,
-                self.model.next_session_closed_at_msk,
-                self.model.day_open_price,
-                self.model.day_close_price,
-                self.model.day_change_percent,
-                self.model.year_change_percent,
-            )
-            .where(self.model.share_id.in_(unique_ids))
-            .distinct(self.model.share_id)
-            .order_by(
-                self.model.share_id.asc(),
-                self.model.captured_at_msk.desc(),
-                self.model.id.desc(),
-            )
-        )
-        result = await self.session.execute(latest_stmt)
-        return {
-            share_id: (
-                price,
-                captured_at_msk,
-                trading_open,
-                session_opened_at_msk,
-                session_closed_at_msk,
-                next_session_opened_at_msk,
-                next_session_closed_at_msk,
-                day_open_price,
-                day_close_price,
-                day_change_percent,
-                year_change_percent,
-            )
-            for (
-                share_id,
-                price,
-                captured_at_msk,
-                trading_open,
-                session_opened_at_msk,
-                session_closed_at_msk,
-                next_session_opened_at_msk,
-                next_session_closed_at_msk,
-                day_open_price,
-                day_close_price,
-                day_change_percent,
-                year_change_percent,
-            ) in result.all()
-        }
 
 
 class TBankUserCredentialRepository(BaseRepository):

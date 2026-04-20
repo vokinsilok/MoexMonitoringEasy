@@ -8,13 +8,11 @@ from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 
 from src.core.logging import main_logger
-from src.db.database import async_session_maker
 from src.core.config import settings
 from src.init import redis_manager
 from src.moduls.tbank.router import tbank_router
-from src.moduls.tbank.tasks import sync_russian_shares_task
+from src.moduls.tbank.tasks import check_all_monitors_task, sync_russian_shares_task
 from src.tasks.broker import broker as taskiq_broker
-from src.utils.db_manager import DBManager
 
 
 
@@ -40,15 +38,30 @@ async def lifespan(add: FastAPI):
             except TimeoutError:
                 continue
 
+    async def schedule_periodic_monitor_checks() -> None:
+        interval_seconds = max(10, settings.TBANK_MONITOR_CHECK_INTERVAL_SECONDS)
+        while not stop_event.is_set():
+            try:
+                await check_all_monitors_task.kiq()
+            except Exception as exc:
+                main_logger.info(f"Failed to enqueue periodic monitor check task: {exc}")
+
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+            except TimeoutError:
+                continue
+
     main_logger.info("Connecting to Redis...")
     await redis_manager.connect()
     await taskiq_broker.startup()
     periodic_sync_task = asyncio.create_task(schedule_periodic_tbank_sync())
+    periodic_monitor_task = asyncio.create_task(schedule_periodic_monitor_checks())
     try:
         yield
     finally:
         stop_event.set()
         await periodic_sync_task
+        await periodic_monitor_task
         await taskiq_broker.shutdown()
         main_logger.info("Disconnecting from Redis...")
         await redis_manager.close()

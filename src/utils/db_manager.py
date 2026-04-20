@@ -10,12 +10,10 @@ class DBManager:
         from src.moduls.tbank.repository import (
             TBankFavoriteShareRepository,
             TBankPriceMonitorRepository,
-            TBankSharePriceRepository,
             TBankShareRepository,
             TBankUserCredentialRepository,
         )
 
-        self.tbank_share_price = TBankSharePriceRepository(self.session)
         self.tbank_share = TBankShareRepository(self.session)
         self.tbank_user_credential = TBankUserCredentialRepository(self.session)
         self.tbank_favorite_share = TBankFavoriteShareRepository(self.session)

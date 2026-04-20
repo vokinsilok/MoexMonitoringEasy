@@ -27,6 +27,22 @@ class TBankExchangeTradingStatus:
     next_session_closed_at_msk: datetime | None
 
 
+@dataclass(slots=True)
+class TBankLastPricePoint:
+    figi: str
+    price: Decimal
+    captured_at_msk: datetime | None
+
+
+@dataclass(slots=True)
+class TBankInstrumentTradingStatus:
+    instrument_id: str
+    trading_status: str | None
+    limit_order_available: bool | None
+    market_order_available: bool | None
+    api_trade_available: bool | None
+
+
 class TBankInvestRequestError(RuntimeError):
     pass
 
@@ -73,6 +89,10 @@ class TBankInvestConnector:
         return TBankSharesResult(instruments=instruments, raw_payload=payload)
 
     async def get_last_prices(self, figies: list[str]) -> dict[str, Decimal]:
+        points = await self.get_last_price_points(figies)
+        return {figi: point.price for figi, point in points.items()}
+
+    async def get_last_price_points(self, figies: list[str]) -> dict[str, TBankLastPricePoint]:
         unique_figies = list(dict.fromkeys([figi.strip() for figi in figies if figi and figi.strip()]))
         if not unique_figies:
             return {}
@@ -87,7 +107,7 @@ class TBankInvestConnector:
                 "Unexpected T-Bank response shape: 'lastPrices' is missing"
             )
 
-        prices: dict[str, Decimal] = {}
+        prices: dict[str, TBankLastPricePoint] = {}
         for item in raw_prices:
             if not isinstance(item, dict):
                 continue
@@ -97,9 +117,179 @@ class TBankInvestConnector:
             price_value = self._quotation_to_decimal(item.get("price"))
             if price_value is None:
                 continue
-            prices[figi] = price_value
+            captured_at_msk: datetime | None = None
+            parsed_time = self._parse_iso_datetime(item.get("time"))
+            if parsed_time is not None:
+                captured_at_msk = self._to_msk_naive(parsed_time)
+            prices[figi] = TBankLastPricePoint(
+                figi=figi,
+                price=price_value,
+                captured_at_msk=captured_at_msk,
+            )
 
         return prices
+
+    async def get_share_by_figi(self, figi: str) -> dict[str, Any]:
+        figi_value = figi.strip()
+        if not figi_value:
+            raise TBankInvestRequestError("figi is required")
+
+        errors: list[TBankInvestRequestError] = []
+
+        try:
+            payload = await self._request_json(
+                "/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/ShareBy",
+                {
+                    "idType": "INSTRUMENT_ID_TYPE_FIGI",
+                    "id": figi_value,
+                },
+            )
+            instrument = payload.get("instrument")
+            if isinstance(instrument, dict):
+                return instrument
+        except TBankInvestRequestError as exc:
+            errors.append(exc)
+            exc_text = str(exc).lower()
+            if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
+                raise
+
+        # Fallback for API environments where ShareBy may be unavailable.
+        instruments = []
+        try:
+            base = await self.get_shares(
+                instrument_status="INSTRUMENT_STATUS_ALL",
+                instrument_exchange="INSTRUMENT_EXCHANGE_UNSPECIFIED",
+            )
+            instruments.extend(base.instruments)
+        except TBankInvestRequestError as exc:
+            errors.append(exc)
+            exc_text = str(exc).lower()
+            if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
+                raise
+        try:
+            dealer = await self.get_shares(
+                instrument_status="INSTRUMENT_STATUS_ALL",
+                instrument_exchange="INSTRUMENT_EXCHANGE_DEALER",
+            )
+            instruments.extend(dealer.instruments)
+        except TBankInvestRequestError as exc:
+            errors.append(exc)
+            exc_text = str(exc).lower()
+            if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
+                raise
+
+        for instrument in instruments:
+            if not isinstance(instrument, dict):
+                continue
+            if str(instrument.get("figi", "")).strip() == figi_value:
+                return instrument
+
+        if errors and not instruments:
+            raise errors[-1]
+        raise TBankInvestRequestError(f"Instrument with FIGI '{figi_value}' not found")
+
+    async def get_daily_metrics(
+        self,
+        *,
+        figi: str,
+        current_price: Decimal | None = None,
+    ) -> dict[str, Decimal | None]:
+        figi_value = figi.strip()
+        if not figi_value:
+            return {
+                "day_open_price": None,
+                "day_close_price": None,
+                "day_change_percent": None,
+                "year_change_percent": None,
+            }
+
+        now_utc = datetime.now(timezone.utc)
+        from_utc = now_utc - timedelta(days=400)
+        payload = await self._request_json(
+            "/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles",
+            {
+                "instrumentId": figi_value,
+                "from": self._to_utc_rfc3339(from_utc),
+                "to": self._to_utc_rfc3339(now_utc),
+                "interval": "CANDLE_INTERVAL_DAY",
+            },
+        )
+        raw_candles = payload.get("candles")
+        if not isinstance(raw_candles, list):
+            return {
+                "day_open_price": None,
+                "day_close_price": None,
+                "day_change_percent": None,
+                "year_change_percent": None,
+            }
+
+        candles: list[tuple[datetime, Decimal, Decimal]] = []
+        for candle in raw_candles:
+            if not isinstance(candle, dict):
+                continue
+            candle_time = self._parse_iso_datetime(candle.get("time"))
+            open_price = self._quotation_to_decimal(candle.get("open"))
+            close_price = self._quotation_to_decimal(candle.get("close"))
+            if candle_time is None or open_price is None or close_price is None:
+                continue
+            candles.append((candle_time, open_price, close_price))
+
+        if not candles:
+            return {
+                "day_open_price": None,
+                "day_close_price": None,
+                "day_change_percent": None,
+                "year_change_percent": None,
+            }
+
+        candles.sort(key=lambda item: item[0])
+        _latest_time, latest_open, latest_close = candles[-1]
+        previous_close = candles[-2][2] if len(candles) > 1 else None
+
+        reference_price = current_price if isinstance(current_price, Decimal) else latest_close
+        day_change_percent: Decimal | None = None
+        if latest_open and latest_open != 0:
+            day_change_percent = ((reference_price - latest_open) / latest_open) * Decimal("100")
+
+        one_year_ago = now_utc - timedelta(days=365)
+        year_base: Decimal | None = None
+        for candle_time, _, candle_close in candles:
+            if candle_time >= one_year_ago:
+                year_base = candle_close
+                break
+        if year_base is None:
+            year_base = candles[0][2]
+
+        year_change_percent: Decimal | None = None
+        if isinstance(year_base, Decimal) and year_base != 0:
+            year_change_percent = ((reference_price - year_base) / year_base) * Decimal("100")
+
+        return {
+            "day_open_price": latest_open,
+            "day_close_price": previous_close,
+            "day_change_percent": day_change_percent,
+            "year_change_percent": year_change_percent,
+        }
+
+    async def get_trading_status(self, instrument_id: str) -> TBankInstrumentTradingStatus:
+        instrument_id_value = instrument_id.strip()
+        if not instrument_id_value:
+            raise TBankInvestRequestError("instrument_id is required")
+
+        payload = await self._request_json(
+            "/rest/tinkoff.public.invest.api.contract.v1.MarketDataService/GetTradingStatus",
+            {"instrumentId": instrument_id_value},
+        )
+        raw_status = payload.get("tradingStatus")
+        status_value = str(raw_status).strip() if raw_status is not None else ""
+
+        return TBankInstrumentTradingStatus(
+            instrument_id=str(payload.get("figi") or instrument_id_value).strip() or instrument_id_value,
+            trading_status=status_value or None,
+            limit_order_available=self._to_optional_bool(payload.get("limitOrderAvailableFlag")),
+            market_order_available=self._to_optional_bool(payload.get("marketOrderAvailableFlag")),
+            api_trade_available=self._to_optional_bool(payload.get("apiTradeAvailableFlag")),
+        )
 
     async def is_exchange_trading_open(self, exchange: str = "MOEX") -> bool:
         status = await self.get_exchange_trading_status(exchange=exchange)
@@ -110,17 +300,32 @@ class TBankInvestConnector:
             raise TBankInvestRequestError("T-Bank token is not configured")
 
         now_utc = datetime.now(timezone.utc)
-        from_utc = now_utc
-        to_utc = now_utc + timedelta(days=3)
+        day_start_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        windows = [
+            (day_start_utc, day_start_utc + timedelta(days=7)),
+            (now_utc, now_utc + timedelta(days=7)),
+        ]
 
-        payload = await self._request_json(
-            "/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/TradingSchedules",
-            {
-                "exchange": exchange,
-                "from": self._to_utc_rfc3339(from_utc),
-                "to": self._to_utc_rfc3339(to_utc),
-            },
-        )
+        payload: dict[str, Any] | None = None
+        last_error: TBankInvestRequestError | None = None
+        for from_utc, to_utc in windows:
+            try:
+                payload = await self._request_json(
+                    "/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/TradingSchedules",
+                    {
+                        "exchange": exchange,
+                        "from": self._to_utc_rfc3339(from_utc),
+                        "to": self._to_utc_rfc3339(to_utc),
+                    },
+                )
+                break
+            except TBankInvestRequestError as exc:
+                last_error = exc
+
+        if payload is None:
+            if last_error is not None:
+                raise last_error
+            raise TBankInvestRequestError("Unable to resolve trading schedule")
 
         raw_exchanges = payload.get("exchanges")
         if not isinstance(raw_exchanges, list):
@@ -186,6 +391,7 @@ class TBankInvestConnector:
         order_type: str,
         price: Decimal | None = None,
         order_id: str | None = None,
+        confirm_margin_trade: bool | None = None,
     ) -> dict[str, Any]:
         if quantity_lots <= 0:
             raise TBankInvestRequestError("quantity_lots must be greater than 0")
@@ -204,6 +410,8 @@ class TBankInvestConnector:
         }
         if price is not None:
             payload["price"] = self._decimal_to_quotation(price)
+        if confirm_margin_trade is not None:
+            payload["confirmMarginTrade"] = bool(confirm_margin_trade)
 
         return await self._request_json(
             "/rest/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder",
@@ -435,6 +643,10 @@ class TBankInvestConnector:
 
     @staticmethod
     def _parse_iso_datetime(raw_value: Any) -> datetime | None:
+        if isinstance(raw_value, datetime):
+            if raw_value.tzinfo is None:
+                return raw_value.replace(tzinfo=timezone.utc)
+            return raw_value.astimezone(timezone.utc)
         if not isinstance(raw_value, str):
             return None
 
@@ -526,9 +738,34 @@ class TBankInvestConnector:
         candidate_keys = [
             ("startTime", "endTime"),
             ("openingTime", "closingTime"),
+            ("mainStartTime", "mainEndTime"),
+            ("eveningStartTime", "eveningEndTime"),
+            ("preMarketStartTime", "preMarketEndTime"),
+            ("afterHoursStartTime", "afterHoursEndTime"),
             ("start", "end"),
         ]
         for start_key, end_key in candidate_keys:
             if start_key in item and end_key in item:
                 pairs.append((item.get(start_key), item.get(end_key)))
+
+        # Fallback: derive an interval from all timestamp-like fields when explicit pairs are absent.
+        if not pairs:
+            times: list[datetime] = []
+            for key, raw_value in item.items():
+                if not isinstance(key, str):
+                    continue
+                if "time" not in key.lower():
+                    continue
+                parsed = TBankInvestConnector._parse_iso_datetime(raw_value)
+                if parsed is not None:
+                    times.append(parsed)
+            if len(times) >= 2:
+                times.sort()
+                pairs.append((times[0], times[-1]))
         return pairs
+
+    @staticmethod
+    def _to_optional_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        return None

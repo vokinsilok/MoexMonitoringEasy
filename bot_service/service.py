@@ -1,5 +1,6 @@
 import httpx
 from decimal import Decimal
+from urllib.parse import quote
 
 from bot_service.config import settings
 from bot_service.models import ShareViewItem
@@ -36,54 +37,24 @@ class TelegramSharesBrowserService:
             raise RuntimeError("Некорректный ответ backend API: поле 'items' отсутствует")
 
         items: list[ShareViewItem] = []
-        for item in raw_items:
-            if not isinstance(item, dict):
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
                 continue
-
-            figi = str(item.get("figi", "")).strip()
-            if not figi:
-                continue
-
-            ticker = str(item.get("ticker", "")).strip() or "—"
-            name = str(item.get("instrument_name", "")).strip() or "Без названия"
-            currency = str(item.get("currency", "")).strip().upper() or "—"
-            exchange_display = str(item.get("exchange_display", "")).strip()
-            exchange_raw = str(item.get("exchange", "")).strip()
-            exchange = exchange_display or exchange_raw or "—"
-
-            items.append(
-                ShareViewItem(
-                    id=self._safe_int(item.get("id")) or 0,
-                    figi=figi,
-                    ticker=ticker,
-                    name=name,
-                    currency=currency,
-                    exchange=exchange,
-                    lot=self._safe_int(self._extract_from_payload(item, "lot")),
-                    nominal=self._extract_nominal(item),
-                    country_of_risk=str(item.get("country_of_risk", "")).strip().upper() or "—",
-                    buy_available=item.get("buy_available"),
-                    sell_available=item.get("sell_available"),
-                    api_trade_available=item.get("api_trade_available"),
-                    short_enabled=item.get("short_enabled"),
-                    isin=self._safe_str(item.get("isin")),
-                    class_code=self._safe_str(item.get("class_code")),
-                    sector=self._safe_str(self._extract_from_payload(item, "sector")),
-                    last_price=self._safe_str(item.get("last_price")),
-                    last_price_captured_at_msk=self._safe_str(item.get("last_price_captured_at_msk")),
-                    trading_open=item.get("trading_open"),
-                    session_opened_at_msk=self._safe_str(item.get("session_opened_at_msk")),
-                    session_closed_at_msk=self._safe_str(item.get("session_closed_at_msk")),
-                    next_session_opened_at_msk=self._safe_str(item.get("next_session_opened_at_msk")),
-                    next_session_closed_at_msk=self._safe_str(item.get("next_session_closed_at_msk")),
-                    day_open_price=self._safe_str(item.get("day_open_price")),
-                    day_close_price=self._safe_str(item.get("day_close_price")),
-                    day_change_percent=self._safe_str(item.get("day_change_percent")),
-                    year_change_percent=self._safe_str(item.get("year_change_percent")),
-                )
-            )
+            parsed = self._to_share_view_item(raw_item)
+            if parsed is not None:
+                items.append(parsed)
 
         return items, total, safe_page, total_pages
+
+    async def get_share_details_online(self, figi: str) -> ShareViewItem:
+        figi_value = figi.strip()
+        if not figi_value:
+            raise RuntimeError("Пустой FIGI")
+        payload = await self._get_payload(f"/api/v1/tbank/shares/{quote(figi_value, safe='')}/online")
+        parsed = self._to_share_view_item(payload)
+        if parsed is None:
+            raise RuntimeError("Некорректный ответ backend API для live-деталей акции")
+        return parsed
 
     async def _fetch_stored_shares_payload(self, limit: int, offset: int) -> dict:
         params = {
@@ -128,6 +99,7 @@ class TelegramSharesBrowserService:
         direction: str,
         order_type: str,
         price: str | None = None,
+        confirm_margin_trade: bool | None = None,
     ) -> dict:
         return await self._post_payload(
             "/api/v1/tbank/orders",
@@ -138,6 +110,7 @@ class TelegramSharesBrowserService:
                 "direction": direction,
                 "order_type": order_type,
                 "price": price,
+                "confirm_margin_trade": confirm_margin_trade,
             },
         )
 
@@ -281,9 +254,6 @@ class TelegramSharesBrowserService:
     async def check_monitors(self, telegram_user_id: int) -> dict:
         return await self._get_payload(f"/api/v1/tbank/monitors/check?telegram_user_id={telegram_user_id}")
 
-    async def check_all_monitors(self) -> dict:
-        return await self._get_payload("/api/v1/tbank/monitors/check-all")
-
     async def get_portfolio(self, telegram_user_id: int) -> dict:
         return await self._post_payload(
             "/api/v1/tbank/portfolio",
@@ -408,6 +378,10 @@ class TelegramSharesBrowserService:
 
     @staticmethod
     def _extract_nominal(item: dict) -> str | None:
+        direct_nominal = TelegramSharesBrowserService._safe_str(item.get("nominal"))
+        if direct_nominal:
+            return direct_nominal
+
         raw_nominal = TelegramSharesBrowserService._extract_from_payload(item, "nominal")
         if not isinstance(raw_nominal, dict):
             return None
@@ -446,3 +420,48 @@ class TelegramSharesBrowserService:
             if alias in payload:
                 return payload.get(alias)
         return None
+
+    def _to_share_view_item(self, item: dict) -> ShareViewItem | None:
+        figi = str(item.get("figi", "")).strip()
+        if not figi:
+            return None
+
+        ticker = str(item.get("ticker", "")).strip() or "—"
+        name = str(item.get("instrument_name", "")).strip() or "Без названия"
+        currency = str(item.get("currency", "")).strip().upper() or "—"
+        exchange_display = str(item.get("exchange_display", "")).strip()
+        exchange_raw = str(item.get("exchange", "")).strip()
+        exchange = exchange_display or exchange_raw or "—"
+
+        return ShareViewItem(
+            id=self._safe_int(item.get("id")) or 0,
+            figi=figi,
+            ticker=ticker,
+            name=name,
+            currency=currency,
+            exchange=exchange,
+            lot=self._safe_int(item.get("lot")) or self._safe_int(self._extract_from_payload(item, "lot")),
+            nominal=self._extract_nominal(item),
+            country_of_risk=str(item.get("country_of_risk", "")).strip().upper() or "—",
+            buy_available=item.get("buy_available"),
+            sell_available=item.get("sell_available"),
+            api_trade_available=item.get("api_trade_available"),
+            short_enabled=item.get("short_enabled"),
+            isin=self._safe_str(item.get("isin")),
+            class_code=self._safe_str(item.get("class_code")),
+            sector=self._safe_str(item.get("sector")) or self._safe_str(self._extract_from_payload(item, "sector")),
+            last_price=self._safe_str(item.get("last_price")),
+            last_price_captured_at_msk=self._safe_str(item.get("last_price_captured_at_msk")),
+            trading_open=item.get("trading_open"),
+            session_opened_at_msk=self._safe_str(item.get("session_opened_at_msk")),
+            session_closed_at_msk=self._safe_str(item.get("session_closed_at_msk")),
+            next_session_opened_at_msk=self._safe_str(item.get("next_session_opened_at_msk")),
+            next_session_closed_at_msk=self._safe_str(item.get("next_session_closed_at_msk")),
+            day_open_price=self._safe_str(item.get("day_open_price")),
+            day_close_price=self._safe_str(item.get("day_close_price")),
+            day_change_percent=self._safe_str(item.get("day_change_percent")),
+            year_change_percent=self._safe_str(item.get("year_change_percent")),
+            trading_status=self._safe_str(item.get("trading_status")),
+            limit_order_available=item.get("limit_order_available"),
+            market_order_available=item.get("market_order_available"),
+        )

@@ -1,8 +1,15 @@
-from datetime import datetime, timedelta
+import json
+from datetime import datetime
 from decimal import Decimal
+from typing import Any
 from zoneinfo import ZoneInfo
 
-from src.connectors.tbank_invest_connector import TBankInvestConnector, TBankInvestRequestError
+from src.connectors.tbank_invest_connector import (
+    TBankInstrumentTradingStatus,
+    TBankInvestConnector,
+    TBankInvestRequestError,
+)
+from src.connectors.redis_connector import RedisManager
 from src.moduls.tbank.schemas import (
     TBankMonitorGlobalCheckResponse,
     TBankMonitorCheckResponse,
@@ -21,9 +28,19 @@ from src.utils.db_manager import DBManager
 
 
 class TBankSharesService:
-    def __init__(self, connector: TBankInvestConnector, db: DBManager | None = None) -> None:
+    _DETAILS_CACHE_TTL_SECONDS = 24 * 60 * 60
+    _PRICE_CACHE_TTL_SECONDS = 45
+    _TRADING_STATUS_CACHE_TTL_SECONDS = 30
+
+    def __init__(
+        self,
+        connector: TBankInvestConnector,
+        db: DBManager | None = None,
+        cache: RedisManager | None = None,
+    ) -> None:
         self.connector = connector
         self.db = db
+        self.cache = cache
 
     async def get_shares(
         self,
@@ -59,15 +76,6 @@ class TBankSharesService:
         if self.db is None:
             raise RuntimeError("DB manager is not configured for sync operation")
 
-        trading_status = None
-        trading_open = True
-        if check_trading_open:
-            try:
-                trading_status = await self.connector.get_exchange_trading_status(exchange="MOEX")
-                trading_open = trading_status.trading_open
-            except TBankInvestRequestError:
-                trading_status = None
-                trading_open = True
         instruments = await self._load_instruments(
             instrument_status=instrument_status,
             instrument_exchange=instrument_exchange,
@@ -82,31 +90,22 @@ class TBankSharesService:
         await self.db.tbank_share.mark_all_inactive()
         synced = await self.db.tbank_share.upsert_many(rows)
         prices_saved = 0
+        trading_open = True
 
         if synced > 0:
             figies = [row["figi"] for row in rows]
-            share_ids_by_figi = await self.db.tbank_share.get_ids_by_figi(figies)
+            await self._cache_instrument_details(instruments)
             last_prices = await self.connector.get_last_prices(figies)
-            share_ids = [share_id for share_id in share_ids_by_figi.values() if share_id]
-            now_msk = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
-            day_start_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-            year_cutoff_msk = now_msk - timedelta(days=365)
-            day_open_prices = await self.db.tbank_share_price.get_first_price_since(share_ids, day_start_msk)
-            day_close_prices = await self.db.tbank_share_price.get_latest_price_before(share_ids, day_start_msk)
-            year_base_prices = await self.db.tbank_share_price.get_latest_price_before(share_ids, year_cutoff_msk)
-            prices_rows = self._to_price_rows(
-                last_prices,
-                share_ids_by_figi,
-                trading_open=trading_open,
-                session_opened_at_msk=trading_status.session_opened_at_msk if trading_status else None,
-                session_closed_at_msk=trading_status.session_closed_at_msk if trading_status else None,
-                next_session_opened_at_msk=trading_status.next_session_opened_at_msk if trading_status else None,
-                next_session_closed_at_msk=trading_status.next_session_closed_at_msk if trading_status else None,
-                day_open_prices=day_open_prices,
-                day_close_prices=day_close_prices,
-                year_base_prices=year_base_prices,
-            )
-            prices_saved = await self.db.tbank_share_price.create_many(prices_rows)
+            await self._cache_last_prices(last_prices)
+            prices_saved = len(last_prices)
+
+        if check_trading_open:
+            try:
+                trading_status = await self.connector.get_exchange_trading_status(exchange="MOEX")
+                trading_open = trading_status.trading_open
+                await self._cache_trading_status(trading_status)
+            except TBankInvestRequestError:
+                trading_open = True
 
         return TBankSyncResponse(
             synced=synced,
@@ -163,24 +162,16 @@ class TBankSharesService:
 
         items = await self.db.tbank_share.list_active(limit=limit, offset=offset)
         total = await self.db.tbank_share.count_active()
-        share_ids = [item.id for item in items if getattr(item, "id", None)]
-        latest_prices = await self.db.tbank_share_price.get_latest_by_share_ids(share_ids)
+        figies = [item.figi for item in items if item.figi]
+        prices_by_figi, captured_at_by_figi = await self._get_last_prices_for_figies(figies)
+        details_by_figi = await self._get_instrument_details_for_figies(figies)
+        trading_status = await self._get_cached_trading_status()
 
         response_items: list[TBankStoredShareItem] = []
         for item in items:
-            (
-                last_price,
-                captured_at_msk,
-                price_trading_open,
-                session_opened_at_msk,
-                session_closed_at_msk,
-                next_session_opened_at_msk,
-                next_session_closed_at_msk,
-                day_open_price,
-                day_close_price,
-                day_change_percent,
-                year_change_percent,
-            ) = latest_prices.get(item.id, (None, None, None, None, None, None, None, None, None, None, None))
+            details = details_by_figi.get(item.figi, {})
+            last_price = prices_by_figi.get(item.figi)
+            captured_at_msk = captured_at_by_figi.get(item.figi)
             exchange_display = self._to_exchange_display(item.real_exchange, item.exchange)
             response_items.append(
                 TBankStoredShareItem.model_validate(
@@ -200,20 +191,25 @@ class TBankSharesService:
                         "short_enabled": item.short_enabled,
                         "real_exchange": item.real_exchange,
                         "exchange_display": exchange_display,
+                        "lot": details.get("lot"),
+                        "sector": details.get("sector"),
+                        "nominal": details.get("nominal"),
                         "is_active": item.is_active,
-                        "instrument_payload": item.instrument_payload,
                         "last_synced_at": item.last_synced_at,
-                        "last_price": last_price,
+                        "last_price": str(last_price) if isinstance(last_price, Decimal) else None,
                         "last_price_captured_at_msk": captured_at_msk,
-                        "trading_open": price_trading_open,
-                        "session_opened_at_msk": session_opened_at_msk,
-                        "session_closed_at_msk": session_closed_at_msk,
-                        "next_session_opened_at_msk": next_session_opened_at_msk,
-                        "next_session_closed_at_msk": next_session_closed_at_msk,
-                        "day_open_price": day_open_price,
-                        "day_close_price": day_close_price,
-                        "day_change_percent": day_change_percent,
-                        "year_change_percent": year_change_percent,
+                        "trading_open": trading_status.trading_open if trading_status else None,
+                        "session_opened_at_msk": trading_status.session_opened_at_msk if trading_status else None,
+                        "session_closed_at_msk": trading_status.session_closed_at_msk if trading_status else None,
+                        "next_session_opened_at_msk": trading_status.next_session_opened_at_msk if trading_status else None,
+                        "next_session_closed_at_msk": trading_status.next_session_closed_at_msk if trading_status else None,
+                        "day_open_price": None,
+                        "day_close_price": None,
+                        "day_change_percent": None,
+                        "year_change_percent": None,
+                        "trading_status": None,
+                        "limit_order_available": None,
+                        "market_order_available": None,
                     }
                 )
             )
@@ -223,6 +219,117 @@ class TBankSharesService:
             limit=limit,
             offset=offset,
             items=response_items,
+        )
+
+    async def get_share_details_online(self, figi: str) -> TBankStoredShareItem | None:
+        figi_value = figi.strip()
+        if not figi_value:
+            return None
+
+        instrument = await self.connector.get_share_by_figi(figi_value)
+        instrument_figi = str(instrument.get("figi", "")).strip() or figi_value
+        exchange_value = self._to_str_or_none(instrument.get("exchange"))
+        real_exchange_value = self._to_str_or_none(instrument.get("realExchange"))
+
+        db_id = 0
+        if self.db is not None:
+            db_item = await self.db.tbank_share.get_active_by_figi(instrument_figi)
+            if db_item is not None:
+                db_id = int(db_item.id)
+
+        price_value: Decimal | None = None
+        price_captured_at_msk: str | None = None
+        try:
+            points = await self.connector.get_last_price_points([instrument_figi])
+            point = points.get(instrument_figi)
+            if point is not None:
+                price_value = point.price
+                if point.captured_at_msk is not None:
+                    price_captured_at_msk = point.captured_at_msk.isoformat()
+        except TBankInvestRequestError:
+            point = None
+
+        trading_status = await self._resolve_trading_status_for_instrument(
+            exchange=exchange_value,
+            real_exchange=real_exchange_value,
+        )
+        instrument_trading_status: TBankInstrumentTradingStatus | None = None
+        try:
+            instrument_trading_status = await self.connector.get_trading_status(instrument_figi)
+        except TBankInvestRequestError:
+            instrument_trading_status = None
+
+        metrics = {
+            "day_open_price": None,
+            "day_close_price": None,
+            "day_change_percent": None,
+            "year_change_percent": None,
+        }
+        try:
+            metrics = await self.connector.get_daily_metrics(figi=instrument_figi, current_price=price_value)
+        except TBankInvestRequestError:
+            metrics = {
+                "day_open_price": None,
+                "day_close_price": None,
+                "day_change_percent": None,
+                "year_change_percent": None,
+            }
+
+        exchange_display = self._to_exchange_display(real_exchange_value, exchange_value)
+
+        return TBankStoredShareItem.model_validate(
+            {
+                "id": db_id,
+                "figi": instrument_figi,
+                "ticker": self._to_str_or_none(instrument.get("ticker")),
+                "class_code": self._to_str_or_none(instrument.get("classCode")),
+                "isin": self._to_str_or_none(instrument.get("isin")),
+                "instrument_name": self._to_str_or_none(instrument.get("name")),
+                "currency": self._to_str_or_none(instrument.get("currency")),
+                "exchange": exchange_value,
+                "country_of_risk": self._to_str_or_none(instrument.get("countryOfRisk")),
+                "buy_available": instrument.get("buyAvailableFlag"),
+                "sell_available": instrument.get("sellAvailableFlag"),
+                "api_trade_available": (
+                    instrument_trading_status.api_trade_available
+                    if instrument_trading_status is not None
+                    else instrument.get("apiTradeAvailableFlag")
+                ),
+                "short_enabled": instrument.get("shortEnabledFlag"),
+                "real_exchange": real_exchange_value,
+                "exchange_display": exchange_display,
+                "lot": self._to_int_or_none(instrument.get("lot")),
+                "sector": self._to_str_or_none(instrument.get("sector")),
+                "nominal": self._format_nominal(instrument.get("nominal")),
+                "is_active": True,
+                "last_synced_at": datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None).isoformat(),
+                "last_price": str(price_value) if isinstance(price_value, Decimal) else None,
+                "last_price_captured_at_msk": price_captured_at_msk,
+                "trading_open": trading_status.trading_open if trading_status else None,
+                "session_opened_at_msk": trading_status.session_opened_at_msk if trading_status else None,
+                "session_closed_at_msk": trading_status.session_closed_at_msk if trading_status else None,
+                "next_session_opened_at_msk": trading_status.next_session_opened_at_msk if trading_status else None,
+                "next_session_closed_at_msk": trading_status.next_session_closed_at_msk if trading_status else None,
+                "day_open_price": self._decimal_to_str(metrics.get("day_open_price")),
+                "day_close_price": self._decimal_to_str(metrics.get("day_close_price")),
+                "day_change_percent": self._decimal_to_str(metrics.get("day_change_percent")),
+                "year_change_percent": self._decimal_to_str(metrics.get("year_change_percent")),
+                "trading_status": (
+                    instrument_trading_status.trading_status
+                    if instrument_trading_status is not None
+                    else None
+                ),
+                "limit_order_available": (
+                    instrument_trading_status.limit_order_available
+                    if instrument_trading_status is not None
+                    else None
+                ),
+                "market_order_available": (
+                    instrument_trading_status.market_order_available
+                    if instrument_trading_status is not None
+                    else None
+                ),
+            }
         )
 
     @staticmethod
@@ -241,61 +348,12 @@ class TBankSharesService:
             "api_trade_available": instrument.get("apiTradeAvailableFlag"),
             "short_enabled": instrument.get("shortEnabledFlag"),
             "real_exchange": instrument.get("realExchange"),
-            "instrument_payload": instrument,
         }
 
     @staticmethod
     def _is_russian_share(instrument: dict) -> bool:
         country_of_risk = str(instrument.get("countryOfRisk", "")).strip().upper()
         return country_of_risk == "RU"
-
-    @staticmethod
-    def _to_price_rows(
-        last_prices: dict[str, object],
-        share_ids_by_figi: dict[str, int],
-        trading_open: bool,
-        session_opened_at_msk: datetime | None,
-        session_closed_at_msk: datetime | None,
-        next_session_opened_at_msk: datetime | None,
-        next_session_closed_at_msk: datetime | None,
-        day_open_prices: dict[int, object],
-        day_close_prices: dict[int, object],
-        year_base_prices: dict[int, object],
-    ) -> list[dict]:
-        captured_at_msk = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
-        rows: list[dict] = []
-        for figi, price in last_prices.items():
-            share_id = share_ids_by_figi.get(figi)
-            if not share_id:
-                continue
-            day_open_price = day_open_prices.get(share_id, price)
-            day_close_price = day_close_prices.get(share_id)
-            year_base_price = year_base_prices.get(share_id)
-            rows.append(
-                {
-                    "share_id": share_id,
-                    "price": price,
-                    "trading_open": trading_open,
-                    "session_opened_at_msk": session_opened_at_msk,
-                    "session_closed_at_msk": session_closed_at_msk,
-                    "next_session_opened_at_msk": next_session_opened_at_msk,
-                    "next_session_closed_at_msk": next_session_closed_at_msk,
-                    "day_open_price": day_open_price,
-                    "day_close_price": day_close_price,
-                    "day_change_percent": TBankSharesService._calculate_change_percent(price, day_close_price),
-                    "year_change_percent": TBankSharesService._calculate_change_percent(price, year_base_price),
-                    "captured_at_msk": captured_at_msk,
-                }
-            )
-        return rows
-
-    @staticmethod
-    def _calculate_change_percent(current_price: object, base_price: object) -> Decimal | None:
-        if not isinstance(current_price, Decimal) or not isinstance(base_price, Decimal):
-            return None
-        if base_price == 0:
-            return None
-        return ((current_price - base_price) / base_price) * Decimal("100")
 
     @staticmethod
     def _to_exchange_display(real_exchange: str | None, exchange: str | None) -> str | None:
@@ -306,6 +364,295 @@ class TBankSharesService:
         if exchange:
             return str(exchange).upper()
         return None
+
+    async def _cache_instrument_details(self, instruments: list[dict]) -> None:
+        for instrument in instruments:
+            figi = str(instrument.get("figi", "")).strip()
+            if not figi:
+                continue
+            payload = {
+                "lot": self._to_int_or_none(instrument.get("lot")),
+                "sector": self._to_str_or_none(instrument.get("sector")),
+                "nominal": self._format_nominal(instrument.get("nominal")),
+            }
+            await self._cache_json(
+                key=f"tbank:share:details:{figi}",
+                payload=payload,
+                ttl_seconds=self._DETAILS_CACHE_TTL_SECONDS,
+            )
+
+    async def _cache_last_prices(self, prices: dict[str, Decimal]) -> None:
+        captured_at_msk = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None).isoformat()
+        for figi, price in prices.items():
+            await self._cache_json(
+                key=f"tbank:share:price:{figi}",
+                payload={
+                    "price": str(price),
+                    "captured_at_msk": captured_at_msk,
+                },
+                ttl_seconds=self._PRICE_CACHE_TTL_SECONDS,
+            )
+
+    async def _cache_trading_status(self, status: Any) -> None:
+        await self._cache_json(
+            key="tbank:exchange:trading_status:MOEX",
+            payload={
+                "trading_open": bool(status.trading_open),
+                "session_opened_at_msk": status.session_opened_at_msk.isoformat() if status.session_opened_at_msk else None,
+                "session_closed_at_msk": status.session_closed_at_msk.isoformat() if status.session_closed_at_msk else None,
+                "next_session_opened_at_msk": status.next_session_opened_at_msk.isoformat() if status.next_session_opened_at_msk else None,
+                "next_session_closed_at_msk": status.next_session_closed_at_msk.isoformat() if status.next_session_closed_at_msk else None,
+            },
+            ttl_seconds=self._TRADING_STATUS_CACHE_TTL_SECONDS,
+        )
+
+    async def _get_last_prices_for_figies(self, figies: list[str]) -> tuple[dict[str, Decimal], dict[str, str]]:
+        prices: dict[str, Decimal] = {}
+        captured_at: dict[str, str] = {}
+        missed: list[str] = []
+
+        for figi in figies:
+            cached = await self._cache_json_get(f"tbank:share:price:{figi}")
+            if not isinstance(cached, dict):
+                missed.append(figi)
+                continue
+            raw_price = cached.get("price")
+            try:
+                price_dec = Decimal(str(raw_price))
+            except Exception:
+                missed.append(figi)
+                continue
+            prices[figi] = price_dec
+            captured_text = self._to_str_or_none(cached.get("captured_at_msk"))
+            if captured_text:
+                captured_at[figi] = captured_text
+
+        if missed:
+            fresh_prices = await self.connector.get_last_prices(missed)
+            await self._cache_last_prices(fresh_prices)
+            prices.update(fresh_prices)
+            fallback_captured_at = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None).isoformat()
+            for figi in fresh_prices:
+                captured_at[figi] = fallback_captured_at
+
+        return prices, captured_at
+
+    async def _get_instrument_details_for_figies(self, figies: list[str]) -> dict[str, dict[str, Any]]:
+        details: dict[str, dict[str, Any]] = {}
+        missing: list[str] = []
+        for figi in figies:
+            cached = await self._cache_json_get(f"tbank:share:details:{figi}")
+            if isinstance(cached, dict):
+                details[figi] = cached
+            else:
+                missing.append(figi)
+
+        if not missing:
+            return details
+
+        try:
+            instruments = await self._load_instruments(
+                instrument_status="INSTRUMENT_STATUS_BASE",
+                instrument_exchange="INSTRUMENT_EXCHANGE_UNSPECIFIED",
+                include_dealer=True,
+            )
+        except TBankInvestRequestError:
+            return details
+
+        by_figi: dict[str, dict] = {}
+        for instrument in instruments:
+            figi = str(instrument.get("figi", "")).strip()
+            if figi:
+                by_figi[figi] = instrument
+
+        missed_instruments = [by_figi[figi] for figi in missing if figi in by_figi]
+        await self._cache_instrument_details(missed_instruments)
+
+        for figi in missing:
+            instrument = by_figi.get(figi)
+            if not instrument:
+                continue
+            details[figi] = {
+                "lot": self._to_int_or_none(instrument.get("lot")),
+                "sector": self._to_str_or_none(instrument.get("sector")),
+                "nominal": self._format_nominal(instrument.get("nominal")),
+            }
+        return details
+
+    async def _get_cached_trading_status(self) -> Any | None:
+        cached = await self._cache_json_get("tbank:exchange:trading_status:MOEX")
+        if isinstance(cached, dict):
+            return _CachedTradingStatus.from_payload(cached)
+        try:
+            fresh = await self.connector.get_exchange_trading_status(exchange="MOEX")
+        except TBankInvestRequestError:
+            return None
+        await self._cache_trading_status(fresh)
+        return fresh
+
+    async def _resolve_trading_status_for_instrument(
+        self,
+        *,
+        exchange: str | None,
+        real_exchange: str | None,
+    ) -> Any | None:
+        candidates: list[str] = []
+        for raw in (exchange, real_exchange):
+            if not raw:
+                continue
+            value = raw.strip().upper()
+            if not value:
+                continue
+            candidates.append(value)
+            if value.startswith("INSTRUMENT_EXCHANGE_"):
+                candidates.append(value.replace("INSTRUMENT_EXCHANGE_", "", 1))
+            if value.startswith("REAL_EXCHANGE_"):
+                candidates.append(value.replace("REAL_EXCHANGE_", "", 1))
+        candidates.extend(["MOEX", "MOEX_PLUS"])
+
+        seen: set[str] = set()
+        normalized_candidates: list[str] = []
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            normalized_candidates.append(candidate)
+
+        fallback_status = None
+        for candidate in normalized_candidates:
+            try:
+                status = await self.connector.get_exchange_trading_status(exchange=candidate)
+            except TBankInvestRequestError:
+                continue
+
+            if (
+                status.trading_open
+                or status.session_opened_at_msk is not None
+                or status.session_closed_at_msk is not None
+                or status.next_session_opened_at_msk is not None
+                or status.next_session_closed_at_msk is not None
+            ):
+                return status
+            if fallback_status is None:
+                fallback_status = status
+
+        return fallback_status
+
+    async def _cache_json(self, key: str, payload: dict[str, Any], ttl_seconds: int) -> None:
+        if self.cache is None:
+            return
+        try:
+            await self.cache.set(
+                key=key,
+                value=json.dumps(payload, ensure_ascii=False),
+                expire=ttl_seconds,
+            )
+        except Exception:
+            return
+
+    async def _cache_json_get(self, key: str) -> dict[str, Any] | None:
+        if self.cache is None:
+            return None
+        try:
+            raw = await self.cache.get(key)
+        except Exception:
+            return None
+        if raw is None:
+            return None
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        if not isinstance(raw, str):
+            return None
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    @staticmethod
+    def _format_nominal(raw_nominal: object) -> str | None:
+        if not isinstance(raw_nominal, dict):
+            return None
+        units_raw = raw_nominal.get("units")
+        nano_raw = raw_nominal.get("nano", 0)
+        currency = str(raw_nominal.get("currency", "")).strip().upper()
+        try:
+            units = int(units_raw)
+            nano = int(nano_raw)
+        except (TypeError, ValueError):
+            return None
+        amount = Decimal(units) + (Decimal(nano) / Decimal(1_000_000_000))
+        normalized = format(amount.normalize(), "f")
+        if "." in normalized:
+            normalized = normalized.rstrip("0").rstrip(".")
+        if currency:
+            return f"{normalized} {currency}"
+        return normalized
+
+    @staticmethod
+    def _to_int_or_none(raw_value: object) -> int | None:
+        try:
+            if raw_value is None:
+                return None
+            return int(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _to_str_or_none(raw_value: object) -> str | None:
+        if raw_value is None:
+            return None
+        value = str(raw_value).strip()
+        return value or None
+
+    @staticmethod
+    def _decimal_to_str(raw_value: object) -> str | None:
+        if not isinstance(raw_value, Decimal):
+            return None
+        return format(raw_value, "f")
+
+
+class _CachedTradingStatus:
+    def __init__(
+        self,
+        *,
+        trading_open: bool,
+        session_opened_at_msk: datetime | None,
+        session_closed_at_msk: datetime | None,
+        next_session_opened_at_msk: datetime | None,
+        next_session_closed_at_msk: datetime | None,
+    ) -> None:
+        self.trading_open = trading_open
+        self.session_opened_at_msk = session_opened_at_msk
+        self.session_closed_at_msk = session_closed_at_msk
+        self.next_session_opened_at_msk = next_session_opened_at_msk
+        self.next_session_closed_at_msk = next_session_closed_at_msk
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "_CachedTradingStatus":
+        return cls(
+            trading_open=bool(payload.get("trading_open")),
+            session_opened_at_msk=cls._parse_dt(payload.get("session_opened_at_msk")),
+            session_closed_at_msk=cls._parse_dt(payload.get("session_closed_at_msk")),
+            next_session_opened_at_msk=cls._parse_dt(payload.get("next_session_opened_at_msk")),
+            next_session_closed_at_msk=cls._parse_dt(payload.get("next_session_closed_at_msk")),
+        )
+
+    @staticmethod
+    def _parse_dt(raw_value: object) -> datetime | None:
+        if not isinstance(raw_value, str):
+            return None
+        value = raw_value.strip()
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
 
 
 ALLOWED_SECTORS: tuple[str, ...] = (
@@ -340,6 +687,7 @@ class TBankTradingService:
         direction: str,
         order_type: str,
         price: str | None,
+        confirm_margin_trade: bool | None = None,
     ) -> dict:
         if not self.account_id:
             raise TBankInvestRequestError("User account_id is not configured")
@@ -358,6 +706,7 @@ class TBankTradingService:
             direction=direction,
             order_type=order_type,
             price=decimal_price,
+            confirm_margin_trade=confirm_margin_trade,
         )
 
     async def cancel_order(self, order_id: str) -> dict:
@@ -420,8 +769,9 @@ class TBankTradingService:
 
 
 class TBankMonitorService:
-    def __init__(self, db: DBManager) -> None:
+    def __init__(self, db: DBManager, connector: TBankInvestConnector | None = None) -> None:
         self.db = db
+        self.connector = connector
 
     async def create_monitor(self, payload: TBankMonitorCreateRequest) -> TBankMonitorItem:
         row = await self.db.tbank_price_monitor.create_monitor(
@@ -451,15 +801,16 @@ class TBankMonitorService:
         if row is None:
             return None
 
-        share = await self.db.tbank_share.get_active_by_figi(row.figi)
-        if share is None:
+        connector = self._require_connector()
+        figi = row.figi.strip()
+        if not figi:
             return None
 
-        latest_map = await self.db.tbank_share_price.get_latest_by_share_ids([share.id])
-        latest = latest_map.get(share.id)
-        if not latest:
+        try:
+            prices = await connector.get_last_prices([figi])
+        except TBankInvestRequestError:
             return None
-        current_price = latest[0]
+        current_price = prices.get(figi)
         if not isinstance(current_price, Decimal):
             return None
 
@@ -487,10 +838,11 @@ class TBankMonitorService:
         )
 
     async def check_monitors(self, telegram_user_id: int) -> TBankMonitorCheckResponse:
+        connector = self._require_connector()
         rows = await self.db.tbank_price_monitor.list_by_user(telegram_user_id)
         now_msk = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
         events: list[TBankMonitorTriggeredEvent] = []
-        checked = 0
+        due_rows = []
 
         for row in rows:
             if not row.is_active:
@@ -501,18 +853,22 @@ class TBankMonitorService:
                 if delta.total_seconds() < row.interval_minutes * 60:
                     continue
 
-            checked += 1
-            share = await self.db.tbank_share.get_active_by_figi(row.figi)
-            if share is None:
-                await self.db.tbank_price_monitor.touch_checked(row.id, now_msk)
-                continue
+            due_rows.append(row)
 
-            latest_map = await self.db.tbank_share_price.get_latest_by_share_ids([share.id])
-            latest = latest_map.get(share.id)
-            if not latest:
-                await self.db.tbank_price_monitor.touch_checked(row.id, now_msk)
-                continue
-            current_price = latest[0]
+        checked = len(due_rows)
+        prices_by_figi: dict[str, Decimal] = {}
+        if due_rows:
+            requested_figies = list(
+                dict.fromkeys([row.figi.strip() for row in due_rows if row.figi and row.figi.strip()])
+            )
+            try:
+                prices_by_figi = await connector.get_last_prices(requested_figies)
+            except TBankInvestRequestError:
+                prices_by_figi = {}
+
+        for row in due_rows:
+            figi = row.figi.strip()
+            current_price = prices_by_figi.get(figi)
             if not isinstance(current_price, Decimal):
                 await self.db.tbank_price_monitor.touch_checked(row.id, now_msk)
                 continue
@@ -593,3 +949,8 @@ class TBankMonitorService:
             last_checked_at_msk=row.last_checked_at_msk,
             last_notified_at_msk=row.last_notified_at_msk,
         )
+
+    def _require_connector(self) -> TBankInvestConnector:
+        if self.connector is None:
+            raise RuntimeError("TBank connector is not configured")
+        return self.connector

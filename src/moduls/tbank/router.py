@@ -5,12 +5,12 @@ from fastapi import APIRouter, HTTPException, Query
 
 from src.connectors.tbank_invest_connector import TBankInvestConnector, TBankInvestRequestError
 from src.core.config import settings
+from src.init import redis_manager
 from src.moduls.tbank.schemas import (
     TBankAllowedSectorsResponse,
     TBankFavoriteShareRequest,
     TBankFavoriteSharesResponse,
     TBankMonitorCheckResponse,
-    TBankMonitorGlobalCheckResponse,
     TBankMonitorCreateRequest,
     TBankMonitorDeleteRequest,
     TBankMonitorRebaseRequest,
@@ -24,6 +24,7 @@ from src.moduls.tbank.schemas import (
     TBankSharesResponse,
     TBankStopOrderCancelRequest,
     TBankStopOrderCreateRequest,
+    TBankStoredShareItem,
     TBankStoredSharesResponse,
     TBankSyncResponse,
     TBankTaskEnqueueResponse,
@@ -89,7 +90,7 @@ async def get_tbank_shares(
     include_dealer: bool = Query(default=True),
 ) -> TBankSharesResponse:
     connector = _build_global_connector()
-    service = TBankSharesService(connector=connector)
+    service = TBankSharesService(connector=connector, cache=redis_manager)
     try:
         return await asyncio.wait_for(
             service.get_shares(
@@ -148,7 +149,7 @@ async def sync_tbank_shares(
     include_dealer: bool = Query(default=True),
 ) -> TBankSyncResponse:
     connector = _build_global_connector()
-    service = TBankSharesService(connector=connector, db=db)
+    service = TBankSharesService(connector=connector, db=db, cache=redis_manager)
     try:
         return await asyncio.wait_for(
             service.sync_shares_to_db(
@@ -186,8 +187,36 @@ async def get_stored_tbank_shares(
     offset: int = Query(default=0, ge=0),
 ) -> TBankStoredSharesResponse:
     connector = _build_global_connector()
-    service = TBankSharesService(connector=connector, db=db)
+    service = TBankSharesService(connector=connector, db=db, cache=redis_manager)
     return await service.get_stored_shares(limit=limit, offset=offset)
+
+
+@tbank_router.get(
+    "/shares/{figi}/online",
+    response_model=TBankStoredShareItem,
+    summary="Получить live-детали акции по FIGI из T-Bank Invest API",
+)
+async def get_online_share_details(
+    figi: str,
+    db: DBDep,
+) -> TBankStoredShareItem:
+    connector = _build_global_connector()
+    service = TBankSharesService(connector=connector, db=db, cache=redis_manager)
+    try:
+        item = await service.get_share_details_online(figi=figi)
+    except TBankInvestRequestError as exc:
+        message = str(exc)
+        if "token is not configured" in message.lower():
+            raise HTTPException(status_code=503, detail=message) from exc
+        if "HTTP 401" in message:
+            raise HTTPException(status_code=401, detail=message) from exc
+        if "HTTP 403" in message:
+            raise HTTPException(status_code=403, detail=message) from exc
+        raise HTTPException(status_code=502, detail=message) from exc
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="Share not found")
+    return item
 
 
 @tbank_router.get(
@@ -249,7 +278,7 @@ async def get_user_credentials_status(
     summary="Создать мониторинг цены по пользователю",
 )
 async def create_monitor(payload: TBankMonitorCreateRequest, db: AtomicDBDep) -> TBankTradingActionResponse:
-    service = TBankMonitorService(db=db)
+    service = TBankMonitorService(db=db, connector=_build_global_connector())
     item = await service.create_monitor(payload)
     return TBankTradingActionResponse(ok=True, details=item.model_dump())
 
@@ -303,7 +332,7 @@ async def remove_favorite(payload: TBankFavoriteShareRequest, db: AtomicDBDep) -
     summary="Список мониторингов пользователя",
 )
 async def list_monitors(db: DBDep, telegram_user_id: int = Query(..., ge=1)) -> TBankMonitorListResponse:
-    service = TBankMonitorService(db=db)
+    service = TBankMonitorService(db=db, connector=_build_global_connector())
     return await service.list_monitors(telegram_user_id)
 
 
@@ -313,7 +342,7 @@ async def list_monitors(db: DBDep, telegram_user_id: int = Query(..., ge=1)) -> 
     summary="Включить или выключить мониторинг",
 )
 async def toggle_monitor(payload: TBankMonitorToggleRequest, db: AtomicDBDep) -> TBankTradingActionResponse:
-    service = TBankMonitorService(db=db)
+    service = TBankMonitorService(db=db, connector=_build_global_connector())
     ok = await service.toggle_monitor(payload.telegram_user_id, payload.monitor_id, payload.is_active)
     if not ok:
         raise HTTPException(status_code=404, detail="Monitor not found")
@@ -326,7 +355,7 @@ async def toggle_monitor(payload: TBankMonitorToggleRequest, db: AtomicDBDep) ->
     summary="Удалить мониторинг",
 )
 async def delete_monitor(payload: TBankMonitorDeleteRequest, db: AtomicDBDep) -> TBankTradingActionResponse:
-    service = TBankMonitorService(db=db)
+    service = TBankMonitorService(db=db, connector=_build_global_connector())
     ok = await service.delete_monitor(payload.telegram_user_id, payload.monitor_id)
     if not ok:
         raise HTTPException(status_code=404, detail="Monitor not found")
@@ -339,7 +368,7 @@ async def delete_monitor(payload: TBankMonitorDeleteRequest, db: AtomicDBDep) ->
     summary="Обновить базовую цену мониторинга по текущей цене",
 )
 async def rebase_monitor(payload: TBankMonitorRebaseRequest, db: AtomicDBDep) -> TBankTradingActionResponse:
-    service = TBankMonitorService(db=db)
+    service = TBankMonitorService(db=db, connector=_build_global_connector())
     new_base = await service.rebase_monitor(payload.telegram_user_id, payload.monitor_id)
     if new_base is None:
         raise HTTPException(status_code=404, detail="Monitor or current price not found")
@@ -358,7 +387,7 @@ async def update_monitor_thresholds(
     payload: TBankMonitorUpdateThresholdsRequest,
     db: AtomicDBDep,
 ) -> TBankTradingActionResponse:
-    service = TBankMonitorService(db=db)
+    service = TBankMonitorService(db=db, connector=_build_global_connector())
     ok = await service.update_thresholds(
         telegram_user_id=payload.telegram_user_id,
         monitor_id=payload.monitor_id,
@@ -383,18 +412,8 @@ async def update_monitor_thresholds(
     summary="Проверить мониторинги пользователя и вернуть сработавшие",
 )
 async def check_monitors(db: AtomicDBDep, telegram_user_id: int = Query(..., ge=1)) -> TBankMonitorCheckResponse:
-    service = TBankMonitorService(db=db)
+    service = TBankMonitorService(db=db, connector=_build_global_connector())
     return await service.check_monitors(telegram_user_id)
-
-
-@tbank_router.get(
-    "/monitors/check-all",
-    response_model=TBankMonitorGlobalCheckResponse,
-    summary="Проверить все активные мониторинги",
-)
-async def check_all_monitors(db: AtomicDBDep) -> TBankMonitorGlobalCheckResponse:
-    service = TBankMonitorService(db=db)
-    return await service.check_all_monitors()
 
 
 @tbank_router.post(
@@ -411,6 +430,7 @@ async def create_order(payload: TBankOrderCreateRequest, db: DBDep) -> TBankTrad
             direction=payload.direction,
             order_type=payload.order_type,
             price=payload.price,
+            confirm_margin_trade=payload.confirm_margin_trade,
         )
         return TBankTradingActionResponse(ok=True, details=result)
     except TBankInvestRequestError as exc:

@@ -30,8 +30,10 @@ class TBankStoredShareItem(BaseModel):
     short_enabled: bool | None = None
     real_exchange: str | None = None
     exchange_display: str | None = None
+    lot: int | None = None
+    sector: str | None = None
+    nominal: str | None = None
     is_active: bool
-    instrument_payload: dict[str, Any]
     last_synced_at: Any
     last_price: Any = None
     last_price_captured_at_msk: Any = None
@@ -44,6 +46,9 @@ class TBankStoredShareItem(BaseModel):
     day_close_price: Any = None
     day_change_percent: Any = None
     year_change_percent: Any = None
+    trading_status: str | None = None
+    limit_order_available: bool | None = None
+    market_order_available: bool | None = None
 
     model_config = {"from_attributes": True}
 
@@ -91,6 +96,7 @@ class TBankOrderCreateRequest(BaseModel):
         examples=["ORDER_TYPE_LIMIT", "ORDER_TYPE_MARKET", "ORDER_TYPE_BESTPRICE"],
     )
     price: str | None = Field(default=None, description="Обязательная для LIMIT, не нужна для MARKET/BESTPRICE")
+    confirm_margin_trade: bool | None = Field(default=None)
 
 
 class TBankOrderCancelRequest(BaseModel):

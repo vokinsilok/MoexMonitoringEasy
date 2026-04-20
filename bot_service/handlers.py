@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import html
 import json
 
@@ -27,6 +27,7 @@ from bot_service.keyboards import (
     CB_PREFIX_DETAILS,
     CB_PREFIX_PAGE,
     CB_REFRESH,
+    CB_REFRESH_DETAILS,
     CB_SEARCH,
     PAGE_SIZE,
     share_details_keyboard,
@@ -72,6 +73,7 @@ STOP_KIND_TAKE_PROFIT_LABEL = "Тейк-профит"
 
 DIRECTION_BUY_LABEL = "Покупка"
 DIRECTION_SELL_LABEL = "Продажа"
+CANCEL_TEXT = "Отмена"
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -150,6 +152,21 @@ def _shares_mode_header(mode: str, query: str | None) -> str:
     return "Режим: <b>Все акции</b>\n"
 
 
+def _order_submit_error_text(exc: RuntimeError) -> str:
+    details = str(exc)
+    if "30042" in details or "Not enough assets for a margin trade" in details:
+        return (
+            "Недостаточно активов для маржинальной сделки (код 30042).\n"
+            "Пополните счет или уменьшите объем заявки."
+        )
+    if "30240" in details or "Confirmation required for specified instrument" in details:
+        return (
+            "Заявка требует подтверждения возможной непокрытой позиции (код 30240).\n"
+            "Флаг confirm_margin_trade уже включён, повторите попытку через несколько секунд."
+        )
+    return f"Не удалось разместить заявку: {exc}"
+
+
 def _shares_filter_items(
     items: list[ShareViewItem],
     *,
@@ -196,10 +213,13 @@ def _format_percent(value: str | None) -> str:
         dec = Decimal(value)
     except (InvalidOperation, ValueError):
         return value
-    normalized = format(dec.normalize(), "f")
+    rounded = dec.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    normalized = format(rounded.normalize(), "f")
     if "." in normalized:
         normalized = normalized.rstrip("0").rstrip(".")
-    sign = "+" if dec > 0 else ""
+    if normalized in ("-0", "-0.0", "-0.00"):
+        normalized = "0"
+    sign = "+" if rounded > 0 else ""
     return f"{sign}{normalized}%"
 
 
@@ -563,10 +583,23 @@ async def _load_page_items(
     force_refresh: bool = False,
 ) -> list[ShareViewItem]:
     data = await state.get_data()
+    mode = data.get("shares_mode") if isinstance(data.get("shares_mode"), str) else "all"
+    query = data.get("shares_query") if isinstance(data.get("shares_query"), str) else ""
     cached_page = data.get("cached_page")
     cached_items = data.get("shares_items_page")
     if isinstance(cached_page, int) and cached_page == page and isinstance(cached_items, list) and not force_refresh:
         return [ShareViewItem(**item) for item in cached_items]
+
+    if mode == "all" and not (query or "").strip():
+        items, total, safe_page, total_pages = await service.get_shares_page(page=page, page_size=PAGE_SIZE)
+        await state.update_data(
+            shares_items_page=[asdict(item) for item in items],
+            cached_page=safe_page,
+            total_items=total,
+            total_pages=total_pages,
+            current_page=safe_page,
+        )
+        return items
 
     filtered = await _load_filtered_items(
         state=state,
@@ -753,6 +786,15 @@ async def cmd_start(message: Message) -> None:
 @router.message(StateFilter("*"), F.text.in_(MAIN_MENU_TEXTS))
 async def menu_interrupt_router(message: Message, state: FSMContext) -> None:
     await _open_menu_section(message, state, message.text)
+
+
+@router.message(Command("cancel"))
+@router.message(StateFilter("*"), F.text == CANCEL_TEXT)
+async def cancel_current_flow(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await _safe_telegram_call(
+        message.answer("Текущее действие отменено.", reply_markup=MAIN_MENU_KEYBOARD)
+    )
 
 
 @router.message(Command("shares"))
@@ -1210,7 +1252,7 @@ async def monitors_list_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == MON_CB_REFRESH)
 async def monitors_refresh_callback(callback: CallbackQuery) -> None:
-    await _safe_telegram_call(callback.answer("..."))
+    await _safe_telegram_call(callback.answer("\u041e\u0431\u043d\u043e\u0432\u043b\u044f\u044e \u0441\u043f\u0438\u0441\u043e\u043a..."))
     await _edit_monitor_list_message(callback)
 
 
@@ -1222,7 +1264,9 @@ async def monitor_item_callback(callback: CallbackQuery) -> None:
     raw_id = callback.data.rsplit(":", maxsplit=1)[1]
     monitor_id = _parse_monitor_id(raw_id)
     if not monitor_id:
-        await _safe_telegram_call(callback.answer(" ID ", show_alert=True))
+        await _safe_telegram_call(
+            callback.answer("\u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 ID \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043d\u0433\u0430", show_alert=True)
+        )
         return
     try:
         payload = await _get_user_monitors_payload(callback.from_user.id)
@@ -1247,7 +1291,9 @@ async def _monitor_action_callback(callback: CallbackQuery, action: str) -> None
     raw_id = callback.data.rsplit(":", maxsplit=1)[1]
     monitor_id = _parse_monitor_id(raw_id)
     if not monitor_id:
-        await _safe_telegram_call(callback.answer(" ID ", show_alert=True))
+        await _safe_telegram_call(
+            callback.answer("\u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 ID \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043d\u0433\u0430", show_alert=True)
+        )
         return
     try:
         if action == "on":
@@ -1265,13 +1311,13 @@ async def _monitor_action_callback(callback: CallbackQuery, action: str) -> None
         return
 
     if action == "del":
-        await _safe_telegram_call(callback.answer(""))
+        await _safe_telegram_call(callback.answer("\u041c\u043e\u043d\u0438\u0442\u043e\u0440 \u0443\u0434\u0430\u043b\u0435\u043d"))
         await _edit_monitor_list_message(callback)
         return
     if action == "rebase":
-        await _safe_telegram_call(callback.answer(" "))
+        await _safe_telegram_call(callback.answer("\u0411\u0430\u0437\u043e\u0432\u0430\u044f \u0446\u0435\u043d\u0430 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0430"))
     else:
-        await _safe_telegram_call(callback.answer(""))
+        await _safe_telegram_call(callback.answer("\u041c\u043e\u043d\u0438\u0442\u043e\u0440 \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d"))
     try:
         payload = await _get_user_monitors_payload(callback.from_user.id)
     except RuntimeError as exc:
@@ -1316,7 +1362,9 @@ async def monitor_edit_callback(callback: CallbackQuery) -> None:
     raw_id = callback.data.rsplit(":", maxsplit=1)[1]
     monitor_id = _parse_monitor_id(raw_id)
     if not monitor_id:
-        await _safe_telegram_call(callback.answer(" ID ", show_alert=True))
+        await _safe_telegram_call(
+            callback.answer("\u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 ID \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043d\u0433\u0430", show_alert=True)
+        )
         return
     await _safe_telegram_call(callback.answer())
     try:
@@ -1325,7 +1373,9 @@ async def monitor_edit_callback(callback: CallbackQuery) -> None:
         await _safe_telegram_call(callback.message.answer(f"Не удалось загрузить монитор: {exc}"))
         return
     if item is None:
-        await _safe_telegram_call(callback.answer("  ", show_alert=True))
+        await _safe_telegram_call(
+            callback.answer("\u041c\u043e\u043d\u0438\u0442\u043e\u0440 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", show_alert=True)
+        )
         return
     await _safe_edit_text(
         callback.message,
@@ -1341,7 +1391,9 @@ async def monitor_edit_back_callback(callback: CallbackQuery) -> None:
     raw_id = callback.data.rsplit(":", maxsplit=1)[1]
     monitor_id = _parse_monitor_id(raw_id)
     if not monitor_id:
-        await _safe_telegram_call(callback.answer(" ID ", show_alert=True))
+        await _safe_telegram_call(
+            callback.answer("\u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 ID \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043d\u0433\u0430", show_alert=True)
+        )
         return
     await _safe_telegram_call(callback.answer())
     try:
@@ -1350,7 +1402,9 @@ async def monitor_edit_back_callback(callback: CallbackQuery) -> None:
         await _safe_telegram_call(callback.message.answer(f"Не удалось загрузить монитор: {exc}"))
         return
     if item is None:
-        await _safe_telegram_call(callback.answer("  ", show_alert=True))
+        await _safe_telegram_call(
+            callback.answer("\u041c\u043e\u043d\u0438\u0442\u043e\u0440 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", show_alert=True)
+        )
         return
     await _safe_edit_text(
         callback.message,
@@ -1371,7 +1425,9 @@ async def _start_monitor_edit_input(
     raw_id = callback.data.rsplit(":", maxsplit=1)[1]
     monitor_id = _parse_monitor_id(raw_id)
     if not monitor_id:
-        await _safe_telegram_call(callback.answer(" ID ", show_alert=True))
+        await _safe_telegram_call(
+            callback.answer("\u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 ID \u043c\u043e\u043d\u0438\u0442\u043e\u0440\u0438\u043d\u0433\u0430", show_alert=True)
+        )
         return
 
     if target == "percent":
@@ -1543,11 +1599,14 @@ async def order_start(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(SharesBrowserStates.order_select_type)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[
-            KeyboardButton(text=ORDER_TYPE_LIMIT_LABEL),
-            KeyboardButton(text=ORDER_TYPE_MARKET_LABEL),
-            KeyboardButton(text=ORDER_TYPE_BESTPRICE_LABEL),
-        ]],
+        keyboard=[
+            [
+                KeyboardButton(text=ORDER_TYPE_LIMIT_LABEL),
+                KeyboardButton(text=ORDER_TYPE_MARKET_LABEL),
+                KeyboardButton(text=ORDER_TYPE_BESTPRICE_LABEL),
+            ],
+            [KeyboardButton(text=CANCEL_TEXT)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -1575,7 +1634,7 @@ async def order_select_type(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(order_type=mapped)
     await state.set_state(SharesBrowserStates.order_select_figi)
-    await _safe_telegram_call(message.answer("Введите тикер или FIGI:"))
+    await _safe_telegram_call(message.answer("Введите тикер или FIGI (или Отмена):"))
 
 
 @router.message(SharesBrowserStates.order_select_figi)
@@ -1589,7 +1648,10 @@ async def order_select_figi(message: Message, state: FSMContext) -> None:
     await state.update_data(order_figi=share.figi, order_ticker=share.ticker)
     await state.set_state(SharesBrowserStates.order_select_direction)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=DIRECTION_BUY_LABEL), KeyboardButton(text=DIRECTION_SELL_LABEL)]],
+        keyboard=[
+            [KeyboardButton(text=DIRECTION_BUY_LABEL), KeyboardButton(text=DIRECTION_SELL_LABEL)],
+            [KeyboardButton(text=CANCEL_TEXT)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -1606,7 +1668,7 @@ async def order_select_direction(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(order_direction=direction)
     await state.set_state(SharesBrowserStates.order_set_quantity)
-    await _safe_telegram_call(message.answer("Введите количество лотов:"))
+    await _safe_telegram_call(message.answer("Введите количество лотов (или Отмена):"))
 
 
 @router.message(SharesBrowserStates.order_set_quantity)
@@ -1622,7 +1684,7 @@ async def order_set_quantity(message: Message, state: FSMContext) -> None:
     await state.update_data(order_quantity=quantity)
     if data.get("order_type") == "ORDER_TYPE_LIMIT":
         await state.set_state(SharesBrowserStates.order_set_price)
-        await _safe_telegram_call(message.answer("Введите цену заявки:"))
+        await _safe_telegram_call(message.answer("Введите цену заявки (или Отмена):"))
         return
     await _submit_order(message, state, None)
 
@@ -1651,35 +1713,16 @@ async def _submit_order(message: Message, state: FSMContext, price: str | None) 
             direction=data["order_direction"],
             order_type=data["order_type"],
             price=price,
+            confirm_margin_trade=True,
         )
     except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось разместить заявку: {exc}"))
+        await _safe_telegram_call(message.answer(_order_submit_error_text(exc)))
         return
     await state.clear()
     await _safe_telegram_call(
         message.answer("✅ Заявка отправлена\n<code>" + _format_json_short(result.get("details", {}), 1200) + "</code>")
     )
     return
-
-    if not message.from_user:
-        return
-    data = await state.get_data()
-    try:
-        result = await service.create_order(
-            telegram_user_id=message.from_user.id,
-            figi=data["order_figi"],
-            quantity_lots=int(data["order_quantity"]),
-            direction=data["order_direction"],
-            order_type=data["order_type"],
-            price=price,
-        )
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось разместить заявку: {exc}"))
-        return
-    await state.clear()
-    await _safe_telegram_call(
-        message.answer("  \n<code>" + _format_json_short(result.get("details", {}), 1200) + "</code>")
-    )
 
 
 @router.message(F.text == " -")
@@ -1688,11 +1731,14 @@ async def stop_start(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(SharesBrowserStates.stop_select_type)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[
-            KeyboardButton(text=STOP_KIND_STOP_LOSS_LABEL),
-            KeyboardButton(text=STOP_KIND_STOP_LOSS_LIMIT_LABEL),
-            KeyboardButton(text=STOP_KIND_TAKE_PROFIT_LABEL),
-        ]],
+        keyboard=[
+            [
+                KeyboardButton(text=STOP_KIND_STOP_LOSS_LABEL),
+                KeyboardButton(text=STOP_KIND_STOP_LOSS_LIMIT_LABEL),
+                KeyboardButton(text=STOP_KIND_TAKE_PROFIT_LABEL),
+            ],
+            [KeyboardButton(text=CANCEL_TEXT)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -1720,7 +1766,7 @@ async def stop_select_type(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(stop_kind=message.text.strip(), stop_order_type=mapped)
     await state.set_state(SharesBrowserStates.stop_select_figi)
-    await _safe_telegram_call(message.answer("Введите тикер или FIGI:"))
+    await _safe_telegram_call(message.answer("Введите тикер или FIGI (или Отмена):"))
 
 
 @router.message(SharesBrowserStates.stop_select_figi)
@@ -1734,7 +1780,10 @@ async def stop_select_figi(message: Message, state: FSMContext) -> None:
     await state.update_data(stop_figi=share.figi, stop_ticker=share.ticker)
     await state.set_state(SharesBrowserStates.stop_select_direction)
     kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=DIRECTION_BUY_LABEL), KeyboardButton(text=DIRECTION_SELL_LABEL)]],
+        keyboard=[
+            [KeyboardButton(text=DIRECTION_BUY_LABEL), KeyboardButton(text=DIRECTION_SELL_LABEL)],
+            [KeyboardButton(text=CANCEL_TEXT)],
+        ],
         resize_keyboard=True,
         one_time_keyboard=True,
     )
@@ -1751,7 +1800,7 @@ async def stop_select_direction(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(stop_direction=direction)
     await state.set_state(SharesBrowserStates.stop_set_quantity)
-    await _safe_telegram_call(message.answer("Введите количество лотов:"))
+    await _safe_telegram_call(message.answer("Введите количество лотов (или Отмена):"))
 
 
 @router.message(SharesBrowserStates.stop_set_quantity)
@@ -1765,7 +1814,7 @@ async def stop_set_quantity(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(stop_quantity=quantity)
     await state.set_state(SharesBrowserStates.stop_set_stop_price)
-    await _safe_telegram_call(message.answer("Введите стоп-цену:"))
+    await _safe_telegram_call(message.answer("Введите стоп-цену (или Отмена):"))
 
 
 @router.message(SharesBrowserStates.stop_set_stop_price)
@@ -1781,7 +1830,7 @@ async def stop_set_stop_price(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if data.get("stop_kind") in {STOP_KIND_STOP_LOSS_LIMIT_LABEL, STOP_KIND_TAKE_PROFIT_LABEL}:
         await state.set_state(SharesBrowserStates.stop_set_limit_price)
-        await _safe_telegram_call(message.answer("Введите лимитную цену (или '-' для рыночного исполнения):"))
+        await _safe_telegram_call(message.answer("Введите лимитную цену (или '-' для рыночного исполнения, или Отмена):"))
         return
     await _submit_stop_order(message, state, None)
 
@@ -1988,10 +2037,21 @@ async def toggle_favorite_callback(callback: CallbackQuery, state: FSMContext) -
         telegram_user_id=callback.from_user.id,
         force_refresh=True,
     )
-    all_items = await _load_items(state=state, force_refresh=False)
-    item = next((share for share in all_items if share.figi == figi), None)
+    item: ShareViewItem | None = None
+    details_item = data.get("details_item")
+    if isinstance(details_item, dict):
+        try:
+            parsed = ShareViewItem(**details_item)
+            if parsed.figi == figi:
+                item = parsed
+        except TypeError:
+            item = None
+    if item is None:
+        all_items = await _load_items(state=state, force_refresh=False)
+        item = next((share for share in all_items if share.figi == figi), None)
     if item is not None:
         current_page = data.get("current_page") if isinstance(data.get("current_page"), int) else 1
+        await state.update_data(details_item=asdict(item))
         await _safe_edit_text(
             callback.message,
             _share_details_text(item),
@@ -2006,11 +2066,40 @@ async def noop_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == CB_REFRESH)
 async def refresh_list(callback: CallbackQuery, state: FSMContext) -> None:
-    await _safe_telegram_call(callback.answer("..."))
+    await _safe_telegram_call(callback.answer("\u041e\u0431\u043d\u043e\u0432\u043b\u044f\u044e \u0441\u043f\u0438\u0441\u043e\u043a..."))
     data = await state.get_data()
     raw_page = data.get("current_page")
     page = raw_page if isinstance(raw_page, int) else 1
     await _edit_page(callback=callback, state=state, page=page, force_refresh=True)
+
+
+@router.callback_query(F.data == CB_REFRESH_DETAILS)
+async def refresh_details(callback: CallbackQuery, state: FSMContext) -> None:
+    await _safe_telegram_call(callback.answer("Обновляю..."))
+    if not callback.from_user or not callback.message:
+        return
+
+    data = await state.get_data()
+    figi = str(data.get("details_figi") or "").strip()
+    if not figi:
+        await _safe_telegram_call(callback.answer("Не удалось определить инструмент", show_alert=True))
+        return
+
+    try:
+        item = await service.get_share_details_online(figi)
+        favorites = await _load_favorite_figies(state=state, telegram_user_id=callback.from_user.id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.answer(f"Ошибка обновления: {exc}", show_alert=True))
+        return
+
+    current_page = data.get("current_page") if isinstance(data.get("current_page"), int) else 1
+    await state.set_state(SharesBrowserStates.viewing_details)
+    await state.update_data(current_page=current_page, details_figi=item.figi, details_item=asdict(item))
+    await _safe_edit_text(
+        callback.message,
+        _share_details_text(item),
+        reply_markup=share_details_keyboard(return_page=current_page, is_favorite=item.figi in favorites),
+    )
 
 
 @router.callback_query(F.data.startswith(f"{CB_PREFIX_PAGE}:"))
@@ -2023,29 +2112,25 @@ async def open_page(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith(f"{CB_PREFIX_DETAILS}:"))
 async def open_details(callback: CallbackQuery, state: FSMContext) -> None:
-    await _safe_telegram_call(callback.answer("..."))
+    await _safe_telegram_call(callback.answer("\u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044e \u0434\u0435\u0442\u0430\u043b\u0438..."))
     if not callback.from_user:
         return
     figi = callback.data.split(":", maxsplit=1)[1]
     data = await state.get_data()
     current_page = data.get("current_page") if isinstance(data.get("current_page"), int) else 1
     try:
-        all_items = await _load_filtered_items(
-            state=state,
-            telegram_user_id=callback.from_user.id,
-        )
         favorites = await _load_favorite_figies(state=state, telegram_user_id=callback.from_user.id)
+        item = await service.get_share_details_online(figi)
     except RuntimeError as exc:
         if callback.message:
-            await _safe_telegram_call(callback.message.answer(f"Не удалось получить список акций: {exc}"))
+            await _safe_telegram_call(callback.message.answer(f"Не удалось получить данные акции онлайн: {exc}"))
         return
-    item = next((share for share in all_items if share.figi == figi), None)
     if item is None:
         if callback.message:
-            await _safe_telegram_call(callback.message.answer("     "))
+            await _safe_telegram_call(callback.message.answer("Инструмент не найден."))
         return
     await state.set_state(SharesBrowserStates.viewing_details)
-    await state.update_data(current_page=current_page, details_figi=item.figi)
+    await state.update_data(current_page=current_page, details_figi=item.figi, details_item=asdict(item))
     if callback.message:
         try:
             await _safe_telegram_call(
@@ -2169,12 +2254,12 @@ def _format_bool(value: bool | None) -> str:
     return "—"
 
 
-def _share_details_text(item: ShareViewItem) -> str:
+def _share_details_text_legacy(item: ShareViewItem) -> str:
     trading_text = "—"
     if item.trading_open is True:
         trading_text = "Идут"
     elif item.trading_open is False:
-        trading_text = ""
+        trading_text = "\u0417\u0430\u043a\u0440\u044b\u0442\u0430"
 
     return (
         f"📊 <b>{item.name}</b>\n"
@@ -2204,6 +2289,130 @@ def _share_details_text(item: ShareViewItem) -> str:
         f"След. открытие: <b>{_format_datetime(item.next_session_opened_at_msk)}</b>\n"
         f"След. закрытие: <b>{_format_datetime(item.next_session_closed_at_msk)}</b>"
     )
+
+
+def _format_bool_legacy(value: bool | None) -> str:
+    if value is True:
+        return "Да"
+    if value is False:
+        return "Нет"
+    return "—"
+
+
+_TRADING_STATUS_LABELS: dict[str, str] = {
+    "UNSPECIFIED": "Не определен",
+    "NOT_AVAILABLE_FOR_TRADING": "Недоступен для торгов",
+    "OPENING_PERIOD": "Период открытия",
+    "CLOSING_PERIOD": "Период закрытия",
+    "BREAK_IN_TRADING": "Перерыв в торгах",
+    "NORMAL_TRADING": "Нормальная торговля",
+    "CLOSING_AUCTION": "Аукцион закрытия",
+    "DARK_POOL_AUCTION": "Dark pool",
+    "DISCRETE_AUCTION": "Дискретный аукцион",
+    "OPENING_AUCTION_PERIOD": "Аукцион открытия",
+    "TRADING_AT_CLOSING_AUCTION_PRICE": "Торги по цене аукциона закрытия",
+    "SESSION_ASSIGNED": "Сессия назначена",
+    "SESSION_CLOSE": "Сессия закрыта",
+    "SESSION_OPEN": "Сессия открыта",
+    "DEALER_NORMAL_TRADING": "Внутренняя ликвидность брокера",
+    "DEALER_BREAK_IN_TRADING": "Перерыв (внутренняя ликвидность)",
+    "DEALER_NOT_AVAILABLE_FOR_TRADING": "Недоступно (внутренняя ликвидность)",
+}
+
+
+def _normalize_trading_status(value: str | None) -> str | None:
+    raw = (value or "").strip().upper()
+    if not raw:
+        return None
+    prefix = "SECURITY_TRADING_STATUS_"
+    if raw.startswith(prefix):
+        return raw.replace(prefix, "", 1)
+    return raw
+
+
+def _format_trading_status(value: str | None) -> str:
+    normalized = _normalize_trading_status(value)
+    if not normalized:
+        return "—"
+    return _TRADING_STATUS_LABELS.get(normalized, normalized)
+
+
+def _can_buy_now(item: ShareViewItem) -> bool | None:
+    if item.buy_available is False:
+        return False
+    if item.api_trade_available is False:
+        return False
+    if item.limit_order_available is False and item.market_order_available is False:
+        return False
+    if item.limit_order_available is True or item.market_order_available is True:
+        return True
+    return None
+
+
+def _buy_now_reason(item: ShareViewItem) -> str:
+    if item.buy_available is False:
+        return "Инструмент недоступен для покупки (buyAvailableFlag=false)."
+    if item.api_trade_available is False:
+        return "Торговля через API недоступна (apiTradeAvailableFlag=false)."
+    if item.limit_order_available is False and item.market_order_available is False:
+        status = _format_trading_status(item.trading_status)
+        return f"По текущему торговому статусу нельзя выставить заявку сейчас ({status})."
+    if item.limit_order_available is True and item.market_order_available is False:
+        return "Сейчас доступна только лимитная заявка."
+    if item.market_order_available is True and item.limit_order_available is False:
+        return "Сейчас доступна только рыночная заявка."
+    if _can_buy_now(item) is True:
+        return "Покупка сейчас доступна."
+    return "Недостаточно данных от API для точного ответа."
+
+
+def _share_details_text_legacy(item: ShareViewItem) -> str:
+    trading_text = "—"
+    if item.trading_open is True:
+        trading_text = "Идут"
+    elif item.trading_open is False:
+        trading_text = "Закрыта"
+
+    can_buy_now_text = _format_bool(_can_buy_now(item))
+    buy_reason_text = _buy_now_reason(item)
+    instrument_trading_status_text = _format_trading_status(item.trading_status)
+
+    return (
+        f"📊 <b>{item.name}</b>\n"
+        f"Тикер: <b>{item.ticker}</b>\n"
+        f"FIGI: <code>{item.figi}</code>\n\n"
+        f"Цена (последняя): <b>{_format_price(item.last_price, item.currency)}</b>\n"
+        f"Время цены (МСК): <b>{_format_datetime(item.last_price_captured_at_msk)}</b>\n"
+        f"Открытие (день): <b>{_format_price(item.day_open_price, item.currency)}</b>\n"
+        f"Закрытие (пред. день): <b>{_format_price(item.day_close_price, item.currency)}</b>\n"
+        f"Изменение за день: <b>{_format_percent(item.day_change_percent)}</b>\n"
+        f"Изменение за год: <b>{_format_percent(item.year_change_percent)}</b>\n"
+        f"Валюта: <b>{item.currency}</b>\n"
+        f"Биржа: <b>{item.exchange}</b>\n"
+        f"Страна риска: <b>{item.country_of_risk}</b>\n"
+        f"Лот: <b>{item.lot if item.lot is not None else '—'}</b>\n"
+        f"Номинал: <b>{item.nominal or '—'}</b>\n"
+        f"ISIN: <code>{item.isin or '—'}</code>\n"
+        f"Класс: <b>{item.class_code or '—'}</b>\n\n"
+        f"Покупка доступна: <b>{_format_bool(item.buy_available)}</b>\n"
+        f"Продажа доступна: <b>{_format_bool(item.sell_available)}</b>\n"
+        f"API-торговля доступна: <b>{_format_bool(item.api_trade_available)}</b>\n"
+        f"Шорт доступен: <b>{_format_bool(item.short_enabled)}</b>\n\n"
+        f"Статус торгов по бумаге: <b>{instrument_trading_status_text}</b>\n"
+        f"Лимитная заявка сейчас: <b>{_format_bool(item.limit_order_available)}</b>\n"
+        f"Рыночная заявка сейчас: <b>{_format_bool(item.market_order_available)}</b>\n"
+        f"Можно купить сейчас: <b>{can_buy_now_text}</b>\n"
+        f"Почему: <b>{buy_reason_text}</b>\n\n"
+        f"🕘 <b>Торговая сессия</b>\n"
+        f"Статус: <b>{trading_text}</b>\n"
+        f"Открытие: <b>{_format_datetime(item.session_opened_at_msk)}</b>\n"
+        f"Закрытие: <b>{_format_datetime(item.session_closed_at_msk)}</b>\n"
+        f"След. открытие: <b>{_format_datetime(item.next_session_opened_at_msk)}</b>\n"
+        f"След. закрытие: <b>{_format_datetime(item.next_session_closed_at_msk)}</b>"
+    )
+
+
+_share_details_text = _share_details_text_legacy
 
 
 def _render_portfolio(details: dict) -> str:
