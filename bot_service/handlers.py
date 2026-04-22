@@ -5,6 +5,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import html
 import json
+import re
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -41,17 +42,6 @@ from bot_service.states import SharesBrowserStates
 router = Router()
 service = TelegramSharesBrowserService()
 
-# Явные русские подписи меню.
-MENU_SHARES = "📈 Список акций"
-MENU_NEW_MONITOR = "🔔 Новый мониторинг"
-MENU_MONITORS = "🧭 Мои мониторинги"
-MENU_PORTFOLIO = "💼 Портфель"
-MENU_OPERATIONS = "🕘 Операции"
-MENU_PROFILE = "🔐 Профиль T-Bank"
-MENU_ORDER = "🧾 Заявка"
-MENU_STOP = "🛑 Стоп-приказ"
-MENU_ACTIVE_ORDERS = "📂 Активные заявки"
-
 # User-facing labels (kept explicit to avoid mojibake regressions).
 MENU_SHARES = "📈 Список акций"
 MENU_NEW_MONITOR = "🔔 Новый мониторинг"
@@ -74,6 +64,9 @@ STOP_KIND_TAKE_PROFIT_LABEL = "Тейк-профит"
 DIRECTION_BUY_LABEL = "Покупка"
 DIRECTION_SELL_LABEL = "Продажа"
 CANCEL_TEXT = "Отмена"
+MONITOR_INTERVAL_MIN_SECONDS = 5
+MONITOR_INTERVAL_MAX_SECONDS = 86_400
+MONITOR_INTERVAL_PRESETS_SECONDS: tuple[int, ...] = (15, 30, 60, 120, 300, 600)
 
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -325,6 +318,73 @@ def _to_clean_num_str(value: object, suffix: str = "") -> str:
         normalized = normalized.rstrip("0").rstrip(".")
     return f"{normalized}{suffix}".strip()
 
+
+def _parse_interval_seconds(raw_text: str) -> int | None:
+    text = (raw_text or "").strip().lower()
+    if not text:
+        return None
+
+    if text.isdigit():
+        return int(text)
+
+    match = re.fullmatch(r"(\d+)\s*(с|сек|сек\.|секунд|sec|s)", text)
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def _format_interval_seconds(raw_value: object) -> str:
+    try:
+        total = int(raw_value)
+    except Exception:
+        return "—"
+    if total <= 0:
+        return "—"
+
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}ч")
+    if minutes:
+        parts.append(f"{minutes}м")
+    if seconds or not parts:
+        parts.append(f"{seconds}с")
+    return " ".join(parts)
+
+
+def _monitor_interval_keyboard() -> ReplyKeyboardMarkup:
+    labels = [f"{value} сек" for value in MONITOR_INTERVAL_PRESETS_SECONDS]
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=labels[0]), KeyboardButton(text=labels[1]), KeyboardButton(text=labels[2])],
+            [KeyboardButton(text=labels[3]), KeyboardButton(text=labels[4]), KeyboardButton(text=labels[5])],
+            [KeyboardButton(text=CANCEL_TEXT)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def _extract_monitor_interval_seconds(item: dict) -> int | None:
+    raw_seconds = item.get("interval_seconds")
+    if raw_seconds is not None:
+        try:
+            return int(raw_seconds)
+        except Exception:
+            return None
+
+    # Backward compatibility for old payloads.
+    raw_minutes = item.get("interval_minutes")
+    if raw_minutes is not None:
+        try:
+            return int(raw_minutes) * 60
+        except Exception:
+            return None
+    return None
+
+
 def _parse_monitor_id(value: object) -> int | None:
     if isinstance(value, int):
         return value if value > 0 else None
@@ -405,24 +465,6 @@ async def _show_monitor_list_message(message: Message) -> None:
     )
     return
 
-    if not message.from_user:
-        return
-    try:
-        payload = await _get_user_monitors_payload(message.from_user.id)
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось загрузить мониторы: {exc}"))
-        return
-    items = payload.get("items", [])
-    if not isinstance(items, list) or not items:
-        await _safe_telegram_call(message.answer("    .", reply_markup=MAIN_MENU_KEYBOARD))
-        return
-    await _safe_telegram_call(
-        message.answer(
-            " <b> </b>\n   :",
-            reply_markup=_monitor_list_keyboard(items),
-        )
-    )
-
 
 MAIN_MENU_TEXTS = {
     MENU_SHARES,
@@ -445,25 +487,6 @@ def _menu_text_equals(actual: str, expected: str) -> bool:
 def _is_main_menu_text(text: str) -> bool:
     normalized = (text or "").strip().casefold()
     return bool(normalized and normalized in MAIN_MENU_TEXTS_NORMALIZED)
-
-    normalized = (text or "").strip().lower()
-    if not normalized:
-        return False
-    return any(
-        key in normalized
-        for key in (
-            " ",
-            " ",
-            " ",
-            "",
-            "",
-            " t-bank",
-            " tbank",
-            "",
-            "-",
-            " ",
-        )
-    ) or normalized.startswith(("📈", "🔔", "🧭", "💼", "🕘", "🔐", "🧾", "🛑", "📂"))
 
 
 async def _edit_monitor_list_message(callback: CallbackQuery) -> None:
@@ -497,23 +520,6 @@ async def _edit_monitor_list_message(callback: CallbackQuery) -> None:
     )
     return
 
-    if not callback.from_user or not callback.message:
-        return
-    try:
-        payload = await _get_user_monitors_payload(callback.from_user.id)
-    except RuntimeError as exc:
-        await _safe_telegram_call(callback.message.answer(f"Не удалось загрузить мониторы: {exc}"))
-        return
-    items = payload.get("items", [])
-    if not isinstance(items, list) or not items:
-        await _safe_edit_text(callback.message, "    .")
-        return
-    await _safe_edit_text(
-        callback.message,
-        " <b> </b>\n   :",
-        reply_markup=_monitor_list_keyboard(items),
-    )
-
 
 def _order_type_map(label: str) -> str | None:
     normalized = (label or "").strip().casefold()
@@ -523,12 +529,6 @@ def _order_type_map(label: str) -> str | None:
         ORDER_TYPE_BESTPRICE_LABEL.casefold(): "ORDER_TYPE_BESTPRICE",
     }
     return mapping.get(normalized)
-
-    return {
-        "": "ORDER_TYPE_LIMIT",
-        "": "ORDER_TYPE_MARKET",
-        " ": "ORDER_TYPE_BESTPRICE",
-    }.get(label)
 
 
 def _stop_type_map(label: str) -> str | None:
@@ -540,12 +540,6 @@ def _stop_type_map(label: str) -> str | None:
     }
     return mapping.get(normalized)
 
-    return {
-        "": "STOP_ORDER_TYPE_STOP_LOSS",
-        "": "STOP_ORDER_TYPE_STOP_LOSS",
-        "": "STOP_ORDER_TYPE_TAKE_PROFIT",
-    }.get(label)
-
 
 def _direction_map(label: str) -> str | None:
     normalized = (label or "").strip().casefold()
@@ -554,11 +548,6 @@ def _direction_map(label: str) -> str | None:
         DIRECTION_SELL_LABEL.casefold(): "ORDER_DIRECTION_SELL",
     }
     return mapping.get(normalized)
-
-    return {
-        "": "ORDER_DIRECTION_BUY",
-        "": "ORDER_DIRECTION_SELL",
-    }.get(label)
 
 
 def _order_type_help_text() -> str:
@@ -833,14 +822,6 @@ async def cmd_start(message: Message) -> None:
     )
     return
 
-    await _safe_telegram_call(
-        message.answer(
-            "!     .\n"
-            ",          T-Bank.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
-    )
-
 
 @router.message(StateFilter("*"), F.text.in_(MAIN_MENU_TEXTS))
 async def menu_interrupt_router(message: Message, state: FSMContext) -> None:
@@ -857,7 +838,7 @@ async def cancel_current_flow(message: Message, state: FSMContext) -> None:
 
 
 @router.message(Command("shares"))
-@router.message(F.text == "  ")
+@router.message(F.text == MENU_SHARES)
 async def open_shares(message: Message, state: FSMContext) -> None:
     await state.update_data(
         shares_mode="all",
@@ -869,7 +850,7 @@ async def open_shares(message: Message, state: FSMContext) -> None:
 
 
 @router.message(Command("profile"))
-@router.message(F.text == "  T-Bank")
+@router.message(F.text == MENU_PROFILE)
 async def profile_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     if not message.from_user:
@@ -897,29 +878,6 @@ async def profile_start(message: Message, state: FSMContext) -> None:
         )
     )
     return
-
-    await state.clear()
-    if not message.from_user:
-        return
-    try:
-        status = await service.get_user_credentials_status(message.from_user.id)
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось загрузить профиль: {exc}"))
-        return
-    configured = bool(status.get("configured"))
-    account_id = status.get("tbank_account_id")
-    account_text = account_id if account_id else "—"
-    status_text = " " if configured else "  "
-    await _safe_telegram_call(
-        message.answer(
-            " <b> T-Bank</b>\n"
-            f"Статус: <b>{status_text}</b>\n"
-            f"Telegram ID: <code>{message.from_user.id}</code>\n"
-            f"Account ID: <code>{account_text}</code>\n\n"
-            "  :",
-            reply_markup=_profile_keyboard(),
-        )
-    )
 
 
 @router.callback_query(F.data == PROF_CB_UPDATE)
@@ -962,27 +920,6 @@ async def profile_check_callback(callback: CallbackQuery) -> None:
     )
     return
 
-    await _safe_telegram_call(callback.answer("..."))
-    if not callback.from_user or not callback.message:
-        return
-    try:
-        status = await service.get_user_credentials_status(callback.from_user.id)
-        if not bool(status.get("configured")):
-            await _safe_telegram_call(callback.message.answer("  .   ."))
-            return
-        portfolio = await service.get_portfolio(callback.from_user.id)
-    except RuntimeError as exc:
-        await _safe_telegram_call(callback.message.answer(f"Проверка не пройдена: {exc}"))
-        return
-    details = portfolio.get("details", {})
-    positions = details.get("positions", []) if isinstance(details, dict) else []
-    await _safe_telegram_call(
-        callback.message.answer(
-            "   T-Bank .\n"
-            f"Позиции в портфеле: <b>{len(positions) if isinstance(positions, list) else 0}</b>"
-        )
-    )
-
 
 @router.message(SharesBrowserStates.profile_set_token)
 async def profile_set_token(message: Message, state: FSMContext) -> None:
@@ -1005,20 +942,6 @@ async def profile_set_token(message: Message, state: FSMContext) -> None:
     )
     await state.update_data(profile_prompt_message_id=(prompt.message_id if prompt else None))
     return
-
-    if not message.text:
-        return
-    data = await state.get_data()
-    await _safe_delete_message(message)
-    await _safe_delete_by_id(message, data.get("profile_prompt_message_id"))
-    token = message.text.strip()
-    if len(token) < 10:
-        await _safe_telegram_call(message.answer("  ,  ."))
-        return
-    await state.update_data(profile_token=token)
-    await state.set_state(SharesBrowserStates.profile_set_account_id)
-    prompt = await _safe_telegram_call(message.answer(" account_id  T-Bank Invest:"))
-    await state.update_data(profile_prompt_message_id=(prompt.message_id if prompt else None))
 
 
 @router.message(SharesBrowserStates.profile_set_account_id)
@@ -1050,34 +973,8 @@ async def profile_set_account_id(message: Message, state: FSMContext) -> None:
     )
     return
 
-    if not message.text or not message.from_user:
-        return
-    data = await state.get_data()
-    await _safe_delete_message(message)
-    await _safe_delete_by_id(message, data.get("profile_prompt_message_id"))
-    account_id = message.text.strip()
-    if len(account_id) < 3:
-        await _safe_telegram_call(message.answer("account_id  ,  ."))
-        return
-    try:
-        await service.upsert_user_credentials(
-            telegram_user_id=message.from_user.id,
-            tbank_token=data["profile_token"],
-            tbank_account_id=account_id,
-        )
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось сохранить профиль: {exc}"))
-        return
-    await state.clear()
-    await _safe_telegram_call(
-        message.answer(
-            f"✅ Профиль сохранён.\nTelegram ID: <b>{message.from_user.id}</b>\nРеквизиты обновлены и скрыты из чата.",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
-    )
 
-
-@router.message(F.text == "  ")
+@router.message(F.text == MENU_NEW_MONITOR)
 async def monitor_start(message: Message, state: FSMContext) -> None:
     await state.set_state(SharesBrowserStates.monitoring_select_company)
     await _safe_telegram_call(
@@ -1089,9 +986,6 @@ async def monitor_start(message: Message, state: FSMContext) -> None:
         )
     )
     return
-
-    await state.set_state(SharesBrowserStates.monitoring_select_company)
-    await _safe_telegram_call(message.answer("   FIGI  :"))
 
 
 @router.message(SharesBrowserStates.monitoring_select_company)
@@ -1114,30 +1008,13 @@ async def monitor_set_company(message: Message, state: FSMContext) -> None:
     await state.set_state(SharesBrowserStates.monitoring_set_interval)
     await _safe_telegram_call(
         message.answer(
-            "Шаг 2/4: введите интервал проверки в минутах.\n"
-            "Чем меньше значение, тем быстрее реакция, но больше запросов.\n"
-            "Пример: <code>5</code>."
+            "Шаг 2/4: задайте интервал проверки в секундах.\n"
+            "Можно нажать готовую кнопку или ввести вручную (например: <code>45</code> или <code>45 сек</code>).\n"
+            f"Допустимый диапазон: <b>{MONITOR_INTERVAL_MIN_SECONDS}..{MONITOR_INTERVAL_MAX_SECONDS}</b> сек.",
+            reply_markup=_monitor_interval_keyboard(),
         )
     )
     return
-
-    if not message.text:
-        return
-    if _is_main_menu_text(message.text):
-        await _open_menu_section(message, state, message.text)
-        return
-    share = await service.find_share_by_ticker_or_figi(message.text)
-    if share is None or not share.last_price:
-        await _safe_telegram_call(message.answer("     .  ."))
-        return
-    await state.update_data(
-        monitor_figi=share.figi,
-        monitor_ticker=share.ticker,
-        monitor_name=share.name,
-        monitor_base_price=share.last_price,
-    )
-    await state.set_state(SharesBrowserStates.monitoring_set_interval)
-    await _safe_telegram_call(message.answer("  (,  5):"))
 
 
 @router.message(SharesBrowserStates.monitoring_set_interval)
@@ -1145,14 +1022,33 @@ async def monitor_set_interval(message: Message, state: FSMContext) -> None:
     if message.text and _is_main_menu_text(message.text):
         await _open_menu_section(message, state, message.text)
         return
-    if not message.text or not message.text.strip().isdigit():
-        await _safe_telegram_call(message.answer("Введите целое число минут."))
+    if not message.text:
+        await _safe_telegram_call(
+            message.answer(
+                "Введите интервал в секундах (например: <code>30</code> или <code>30 сек</code>).",
+                reply_markup=_monitor_interval_keyboard(),
+            )
+        )
         return
-    minutes = int(message.text.strip())
-    if minutes <= 0:
-        await _safe_telegram_call(message.answer("Интервал должен быть больше 0."))
+    interval_seconds = _parse_interval_seconds(message.text)
+    if interval_seconds is None:
+        await _safe_telegram_call(
+            message.answer(
+                "Не понял интервал. Введите секунды числом или с суффиксом «сек».\n"
+                "Примеры: <code>15</code>, <code>30 сек</code>, <code>120</code>.",
+                reply_markup=_monitor_interval_keyboard(),
+            )
+        )
         return
-    await state.update_data(monitor_interval=minutes)
+    if not (MONITOR_INTERVAL_MIN_SECONDS <= interval_seconds <= MONITOR_INTERVAL_MAX_SECONDS):
+        await _safe_telegram_call(
+            message.answer(
+                f"Интервал должен быть в диапазоне {MONITOR_INTERVAL_MIN_SECONDS}..{MONITOR_INTERVAL_MAX_SECONDS} сек.",
+                reply_markup=_monitor_interval_keyboard(),
+            )
+        )
+        return
+    await state.update_data(monitor_interval_seconds=interval_seconds)
     await state.set_state(SharesBrowserStates.monitoring_set_threshold_percent)
     await _safe_telegram_call(
         message.answer(
@@ -1205,7 +1101,7 @@ async def monitor_finish(message: Message, state: FSMContext) -> None:
             figi=data["monitor_figi"],
             ticker=data.get("monitor_ticker"),
             instrument_name=data.get("monitor_name"),
-            interval_minutes=int(data["monitor_interval"]),
+            interval_seconds=int(data["monitor_interval_seconds"]),
             threshold_percent=str(data["monitor_percent"]),
             threshold_rub=message.text.replace(",", ".").strip(),
             base_price=str(data["monitor_base_price"]),
@@ -1216,60 +1112,24 @@ async def monitor_finish(message: Message, state: FSMContext) -> None:
 
     await state.clear()
     details = created.get("details", {})
+    interval_value = details.get("interval_seconds")
+    if interval_value is None:
+        interval_value = data.get("monitor_interval_seconds")
     await _safe_telegram_call(
         message.answer(
             "✅ Мониторинг создан\n"
             f"ID: <b>{details.get('id')}</b>\n"
             f"Инструмент: <b>{details.get('ticker') or details.get('figi')}</b>\n"
-            f"Интервал: <b>{details.get('interval_minutes')} мин</b>\n"
+            f"Интервал: <b>{_format_interval_seconds(interval_value)}</b>\n"
             f"Порог: <b>{details.get('threshold_percent')}%</b> или <b>{details.get('threshold_rub')} RUB</b>",
             reply_markup=MAIN_MENU_KEYBOARD,
         )
     )
     return
 
-    if not message.text or not message.from_user:
-        return
-    if _is_main_menu_text(message.text):
-        await _open_menu_section(message, state, message.text)
-        return
-    try:
-        Decimal(message.text.replace(",", ".").strip())
-    except Exception:
-        await _safe_telegram_call(message.answer("  ."))
-        return
-    data = await state.get_data()
-    try:
-        created = await service.create_monitor(
-            telegram_user_id=message.from_user.id,
-            figi=data["monitor_figi"],
-            ticker=data.get("monitor_ticker"),
-            instrument_name=data.get("monitor_name"),
-            interval_minutes=int(data["monitor_interval"]),
-            threshold_percent=str(data["monitor_percent"]),
-            threshold_rub=message.text.replace(",", ".").strip(),
-            base_price=str(data["monitor_base_price"]),
-        )
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось создать мониторинг: {exc}"))
-        return
-
-    await state.clear()
-    details = created.get("details", {})
-    await _safe_telegram_call(
-        message.answer(
-            "  \n"
-            f"ID: <b>{details.get('id')}</b>\n"
-            f"Инструмент: <b>{details.get('ticker') or details.get('figi')}</b>\n"
-            f"Интервал: <b>{details.get('interval_minutes')} мин</b>\n"
-            f"Порог: <b>{details.get('threshold_percent')}%</b> или <b>{details.get('threshold_rub')}</b>",
-            reply_markup=MAIN_MENU_KEYBOARD,
-        )
-    )
-
 
 @router.message(Command("monitors"))
-@router.message(F.text == "  ")
+@router.message(F.text == MENU_MONITORS)
 async def list_monitors(message: Message) -> None:
     await _show_monitor_list_message(message)
 
@@ -1303,26 +1163,6 @@ async def _monitor_state_change(message: Message, target_state: bool | None = No
     if result.get("ok"):
         await _safe_telegram_call(message.answer(ok_text))
     return
-
-    if not message.from_user or not message.text:
-        return
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2 or not parts[1].strip().isdigit():
-        await _safe_telegram_call(message.answer(" ID:  /monitor_off 12"))
-        return
-    monitor_id = int(parts[1].strip())
-    try:
-        if delete:
-            result = await service.delete_monitor(message.from_user.id, monitor_id)
-            ok_text = f"✅ Монитор #{monitor_id} удалён"
-        else:
-            result = await service.toggle_monitor(message.from_user.id, monitor_id, bool(target_state))
-            ok_text = f"✅ Монитор #{monitor_id} {'' if target_state else ''}"
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Операция не выполнена: {exc}"))
-        return
-    if result.get("ok"):
-        await _safe_telegram_call(message.answer(ok_text))
 
 
 @router.message(Command("monitor_on"))
@@ -1643,7 +1483,7 @@ async def monitor_edit_set_rub(message: Message, state: FSMContext) -> None:
     await _apply_monitor_edit_value(message, state, "rub")
 
 
-@router.message(F.text == " ")
+@router.message(F.text == MENU_PORTFOLIO)
 async def show_portfolio(message: Message) -> None:
     if not message.from_user:
         return
@@ -1659,7 +1499,7 @@ async def show_portfolio(message: Message) -> None:
     )
 
 
-@router.message(F.text == " ")
+@router.message(F.text == MENU_OPERATIONS)
 async def operations_start(message: Message, state: FSMContext) -> None:
     if not message.from_user:
         return
@@ -1695,7 +1535,7 @@ async def operations_show(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(F.text == " ")
+@router.message(F.text == MENU_ORDER)
 async def order_start(message: Message, state: FSMContext) -> None:
     if not await _ensure_user_credentials(message):
         return
@@ -1714,16 +1554,6 @@ async def order_start(message: Message, state: FSMContext) -> None:
     )
     await _safe_telegram_call(message.answer(_order_type_help_text(), reply_markup=kb))
     return
-
-    if not await _ensure_user_credentials(message):
-        return
-    await state.set_state(SharesBrowserStates.order_select_type)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=""), KeyboardButton(text=""), KeyboardButton(text=" ")]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    await _safe_telegram_call(message.answer("  :", reply_markup=kb))
 
 
 @router.message(SharesBrowserStates.order_select_type)
@@ -1849,7 +1679,7 @@ async def _submit_order(message: Message, state: FSMContext, price: str | None) 
     return
 
 
-@router.message(F.text == " -")
+@router.message(F.text == MENU_STOP)
 async def stop_start(message: Message, state: FSMContext) -> None:
     if not await _ensure_user_credentials(message):
         return
@@ -1868,16 +1698,6 @@ async def stop_start(message: Message, state: FSMContext) -> None:
     )
     await _safe_telegram_call(message.answer(_stop_type_help_text(), reply_markup=kb))
     return
-
-    if not await _ensure_user_credentials(message):
-        return
-    await state.set_state(SharesBrowserStates.stop_select_type)
-    kb = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=""), KeyboardButton(text=""), KeyboardButton(text="")]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    await _safe_telegram_call(message.answer(" -:", reply_markup=kb))
 
 
 @router.message(SharesBrowserStates.stop_select_type)
@@ -2030,29 +1850,8 @@ async def _submit_stop_order(message: Message, state: FSMContext, price: str | N
     )
     return
 
-    if not message.from_user:
-        return
-    data = await state.get_data()
-    try:
-        result = await service.create_stop_order(
-            telegram_user_id=message.from_user.id,
-            figi=data["stop_figi"],
-            quantity_lots=int(data["stop_quantity"]),
-            direction=data["stop_direction"],
-            stop_order_type=data["stop_order_type"],
-            stop_price=data["stop_price"],
-            price=price,
-        )
-    except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось разместить стоп-приказ: {exc}"))
-        return
-    await state.clear()
-    await _safe_telegram_call(
-        message.answer(" - \n<code>" + _format_json_short(result.get("details", {}), 1200) + "</code>")
-    )
 
-
-@router.message(F.text == "  ")
+@router.message(F.text == MENU_ACTIVE_ORDERS)
 async def open_active_orders(message: Message) -> None:
     if not message.from_user:
         return
@@ -2463,28 +2262,6 @@ async def menu_fallback_router(message: Message, state: FSMContext) -> None:
     if _is_main_menu_text(text):
         await _open_menu_section(message, state, text)
     return
-    text = (message.text or "").strip()
-    if not text:
-        return
-    low = text.lower()
-    is_menu = any(
-        key in low
-        for key in (
-            " ",
-            " ",
-            " ",
-            "",
-            "",
-            " t-bank",
-            " tbank",
-            "",
-            "-",
-            " ",
-        )
-    ) or text.startswith(("📈", "🔔", "🧭", "💼", "🕘", "🔐", "🧾", "🛑", "📂"))
-
-    if is_menu:
-        await _open_menu_section(message, state, text)
 
 
 
@@ -2523,33 +2300,6 @@ async def _open_menu_section(message: Message, state: FSMContext, text: str) -> 
         return
 
     return
-
-    if " " in normalized or normalized.startswith("📈"):
-        await open_shares(message, state)
-        return
-    if " " in normalized or normalized.startswith("🔔"):
-        await monitor_start(message, state)
-        return
-    if " " in normalized or normalized.startswith("🧭"):
-        await list_monitors(message)
-        return
-    if "" in normalized or normalized.startswith("💼"):
-        await show_portfolio(message)
-        return
-    if "" in normalized or normalized.startswith("🕘"):
-        await operations_start(message, state)
-        return
-    if " t-bank" in normalized or " tbank" in normalized or normalized.startswith("🔐"):
-        await profile_start(message, state)
-        return
-    if "" in normalized or normalized.startswith("🧾"):
-        await order_start(message, state)
-        return
-    if "-" in normalized or normalized.startswith("🛑"):
-        await stop_start(message, state)
-        return
-    if " " in normalized or normalized.startswith("📂"):
-        await open_active_orders(message)
 
 
 def _format_bool(value: bool | None) -> str:
@@ -2788,62 +2538,6 @@ def _render_portfolio(details: dict) -> str:
         lines.append(f"Показаны первые <b>12</b> из <b>{len(positions)}</b> позиций.")
     return "\n".join(lines)
 
-    if not isinstance(details, dict):
-        return " <b></b>\n ."
-
-    total_shares = _money_from_quotation(details.get("totalAmountShares"))
-    total_bonds = _money_from_quotation(details.get("totalAmountBonds"))
-    total_etf = _money_from_quotation(details.get("totalAmountEtf"))
-    total_curr = _money_from_quotation(details.get("totalAmountCurrencies"))
-    total_futures = _money_from_quotation(details.get("totalAmountFutures"))
-    expected_yield = _money_from_quotation(details.get("expectedYield"))
-    currency = _extract_currency(details.get("totalAmountShares"), "RUB")
-    total_all = (
-        (total_shares or Decimal("0"))
-        + (total_bonds or Decimal("0"))
-        + (total_etf or Decimal("0"))
-        + (total_curr or Decimal("0"))
-        + (total_futures or Decimal("0"))
-    )
-    lines = [
-        " <b> T-Bank</b>",
-        f"Общая стоимость: <b>{_format_decimal_human(total_all)} {currency}</b>",
-        f"Ожидаемый P/L: <b>{_format_decimal_human(expected_yield)} {currency}</b>",
-        "",
-        ":",
-        f"• Акции: <b>{_format_decimal_human(total_shares)} {currency}</b>",
-        f"• Облигации: <b>{_format_decimal_human(total_bonds)} {currency}</b>",
-        f"• Фонды: <b>{_format_decimal_human(total_etf)} {currency}</b>",
-        f"• Валюты: <b>{_format_decimal_human(total_curr)} {currency}</b>",
-        f"• Фьючерсы: <b>{_format_decimal_human(total_futures)} {currency}</b>",
-    ]
-    positions = details.get("positions")
-    if not isinstance(positions, list) or not positions:
-        lines.append("")
-        lines.append(": ")
-        return "\n".join(lines)
-    lines.append("")
-    lines.append(f"Позиции ({len(positions)}):")
-    for i, pos in enumerate(positions[:12], start=1):
-        if not isinstance(pos, dict):
-            continue
-        ticker = str(pos.get("ticker") or pos.get("figi") or "UNKNOWN")
-        instrument_type = str(pos.get("instrumentType") or "unknown")
-        quantity_lots = _format_decimal_plain(_money_from_quotation(pos.get("quantityLots")))
-        quantity_total = _format_decimal_plain(_money_from_quotation(pos.get("quantity")))
-        avg_price = _format_money(pos.get("averagePositionPrice"))
-        current_price = _format_money(pos.get("currentPrice"))
-        pos_yield = _format_money(pos.get("expectedYield"), fallback_currency="")
-        blocked = bool(pos.get("blocked"))
-        blocked_lots = _format_decimal_plain(_money_from_quotation(pos.get("blockedLots")))
-        lines.append(f"{i}. <b>{html.escape(ticker)}</b> · {html.escape(instrument_type)}")
-        lines.append(f"   Лоты: <b>{quantity_lots}</b> | Количество: <b>{quantity_total}</b>")
-        lines.append(f"   Средняя: <b>{avg_price}</b>")
-        lines.append(f"   Текущая: <b>{current_price}</b>")
-        lines.append(f"   P/L: <b>{pos_yield}</b>")
-        lines.append(f"   Блок: <b>{'Да' if blocked else 'Нет'}</b> (лоты: <b>{blocked_lots}</b>)")
-    return "\n".join(lines)
-
 
 def _render_operations(details: dict, days: int) -> str:
     if not isinstance(details, dict):
@@ -2908,55 +2602,6 @@ def _render_operations(details: dict, days: int) -> str:
         lines.append("")
     if len(operations) > 20:
         lines.append(f"Показаны первые <b>20</b> из <b>{len(operations)}</b> операций.")
-    return "\n".join(lines)
-
-    if not isinstance(details, dict):
-        return " <b></b>\n ."
-    operations = details.get("operations")
-    if not isinstance(operations, list):
-        return " <b></b>\n ."
-
-    total_in = Decimal("0")
-    total_out = Decimal("0")
-    for op in operations:
-        if not isinstance(op, dict):
-            continue
-        payment_dec = _money_from_quotation(op.get("payment"))
-        if payment_dec is None:
-            continue
-        if payment_dec >= 0:
-            total_in += payment_dec
-        else:
-            total_out += payment_dec
-
-    lines = [
-        f"🕘 <b>Операции за {days} дн.</b>",
-        f"Всего: <b>{len(operations)}</b> | Вход: <b>{_format_decimal_human(total_in)} RUB</b> | Выход: <b>{_format_decimal_human(total_out)} RUB</b>",
-        "",
-    ]
-    if not operations:
-        lines.append("    .")
-        return "\n".join(lines)
-    for i, op in enumerate(operations[:20], start=1):
-        if not isinstance(op, dict):
-            continue
-        dt = str(op.get("date") or "—")
-        try:
-            parsed = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-            dt = parsed.strftime("%d.%m.%Y %H:%M:%S")
-        except Exception:
-            pass
-        op_type = str(op.get("type") or op.get("operationType") or "UNKNOWN")
-        ticker = str(op.get("ticker") or op.get("figi") or "—")
-        payment = _format_money(op.get("payment"), fallback_currency="")
-        quantity = _decimal_from_any(op.get("quantity")) or _decimal_from_any(op.get("quantityExecuted")) or _decimal_from_any(op.get("quantityLots"))
-        quantity_text = _format_decimal_human(quantity, decimals=6) if quantity is not None else "—"
-        lines.append(f"{i}. <b>{html.escape(op_type)}</b>")
-        lines.append(f"   Инструмент: <b>{html.escape(ticker)}</b>")
-        lines.append(f"   Дата: <b>{html.escape(dt)}</b>")
-        lines.append(f"   Количество: <b>{html.escape(quantity_text)}</b>")
-        lines.append(f"   Сумма: <b>{html.escape(payment)}</b>")
-        lines.append("")
     return "\n".join(lines)
 
 
@@ -3046,11 +2691,11 @@ def _monitor_list_keyboard(items: list[dict]) -> InlineKeyboardMarkup:
             continue
         ticker = str(item.get("ticker") or item.get("figi") or "UNKNOWN")
         status = "🟢" if item.get("is_active") else "⚪"
-        interval = item.get("interval_minutes")
+        interval = _format_interval_seconds(_extract_monitor_interval_seconds(item))
         rows.append(
             [
                 InlineKeyboardButton(
-                    text=f"{status} #{monitor_id} {ticker} · {interval}м",
+                    text=f"{status} #{monitor_id} {ticker} · {interval}",
                     callback_data=f"{MON_CB_ITEM_PREFIX}:{monitor_id}",
                 )
             ]
@@ -3058,27 +2703,16 @@ def _monitor_list_keyboard(items: list[dict]) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(text="Обновить", callback_data=MON_CB_REFRESH)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    rows: list[list[InlineKeyboardButton]] = []
-    for item in items:
-        monitor_id = _parse_monitor_id(item.get("id"))
-        if not monitor_id:
-            continue
-        ticker = str(item.get("ticker") or item.get("figi") or "UNKNOWN")
-        status = "🟢" if item.get("is_active") else "⚪"
-        interval = item.get("interval_minutes")
-        rows.append([InlineKeyboardButton(text=f"{status} #{monitor_id} {ticker} · {interval}м", callback_data=f"{MON_CB_ITEM_PREFIX}:{monitor_id}")])
-    rows.append([InlineKeyboardButton(text="  ", callback_data=MON_CB_REFRESH)])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def _monitor_detail_text(item: dict) -> str:
     status = "Включен" if item.get("is_active") else "Выключен"
+    interval = _format_interval_seconds(_extract_monitor_interval_seconds(item))
     return (
         f"🧭 <b>Монитор #{_parse_monitor_id(item.get('id')) or '—'}</b>\n"
         f"Инструмент: <b>{html.escape(str(item.get('ticker') or item.get('figi') or '—'))}</b>\n"
         f"FIGI: <code>{html.escape(str(item.get('figi') or '—'))}</code>\n"
         f"Статус: <b>{status}</b>\n"
-        f"Интервал: <b>{item.get('interval_minutes')} мин</b>\n"
+        f"Интервал: <b>{interval}</b>\n"
         f"Порог: <b>{_to_clean_num_str(item.get('threshold_percent'), '%')}</b> или <b>{_to_clean_num_str(item.get('threshold_rub'))} RUB</b>\n"
         f"Базовая цена: <b>{_to_clean_num_str(item.get('base_price'))} RUB</b>\n"
         f"Последняя проверка: <b>{_format_datetime(str(item.get('last_checked_at_msk')) if item.get('last_checked_at_msk') else None)}</b>\n"
@@ -3088,19 +2722,6 @@ def _monitor_detail_text(item: dict) -> str:
         "• Изменить пороги (%) и RUB\n"
         "• Обновить базовую цену\n"
         "• Удалить монитор"
-    )
-
-    status = " " if item.get("is_active") else " "
-    return (
-        f"🧭 <b>Монитор #{_parse_monitor_id(item.get('id')) or '—'}</b>\n"
-        f"Инструмент: <b>{html.escape(str(item.get('ticker') or item.get('figi') or '—'))}</b>\n"
-        f"FIGI: <code>{html.escape(str(item.get('figi') or '—'))}</code>\n"
-        f"Статус: <b>{status}</b>\n"
-        f"Интервал: <b>{item.get('interval_minutes')} мин</b>\n"
-        f"Порог: <b>{_to_clean_num_str(item.get('threshold_percent'), '%')}</b> или <b>{_to_clean_num_str(item.get('threshold_rub'))} RUB</b>\n"
-        f"Базовая цена: <b>{_to_clean_num_str(item.get('base_price'))} RUB</b>\n"
-        f"Последняя проверка: <b>{_format_datetime(str(item.get('last_checked_at_msk')) if item.get('last_checked_at_msk') else None)}</b>\n"
-        f"Последний алерт: <b>{_format_datetime(str(item.get('last_notified_at_msk')) if item.get('last_notified_at_msk') else None)}</b>"
     )
 
 
@@ -3119,20 +2740,6 @@ def _monitor_detail_keyboard(item: dict) -> InlineKeyboardMarkup:
         ]
     )
 
-    monitor_id = _parse_monitor_id(item.get("id"))
-    active = bool(item.get("is_active"))
-    toggle_cb = f"{MON_CB_OFF_PREFIX}:{monitor_id}" if active else f"{MON_CB_ON_PREFIX}:{monitor_id}"
-    toggle_text = " " if active else " "
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=toggle_text, callback_data=toggle_cb)],
-            [InlineKeyboardButton(text="  ", callback_data=f"{MON_CB_EDIT_PREFIX}:{monitor_id}")],
-            [InlineKeyboardButton(text="  ", callback_data=f"{MON_CB_REBASE_PREFIX}:{monitor_id}")],
-            [InlineKeyboardButton(text=" ", callback_data=f"{MON_CB_DEL_PREFIX}:{monitor_id}")],
-            [InlineKeyboardButton(text="  ", callback_data=MON_CB_LIST)],
-        ]
-    )
-
 
 def _monitor_edit_menu_keyboard(monitor_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -3140,14 +2747,6 @@ def _monitor_edit_menu_keyboard(monitor_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="Изменить %", callback_data=f"{MON_CB_EDIT_PERCENT_PREFIX}:{monitor_id}")],
             [InlineKeyboardButton(text="Изменить RUB", callback_data=f"{MON_CB_EDIT_RUB_PREFIX}:{monitor_id}")],
             [InlineKeyboardButton(text="Назад", callback_data=f"{MON_CB_EDIT_BACK_PREFIX}:{monitor_id}")],
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="  %", callback_data=f"{MON_CB_EDIT_PERCENT_PREFIX}:{monitor_id}")],
-            [InlineKeyboardButton(text="  RUB", callback_data=f"{MON_CB_EDIT_RUB_PREFIX}:{monitor_id}")],
-            [InlineKeyboardButton(text="", callback_data=f"{MON_CB_EDIT_BACK_PREFIX}:{monitor_id}")],
         ]
     )
 
@@ -3163,26 +2762,11 @@ def _monitor_edit_menu_text(item: dict) -> str:
         "• <b>Изменить RUB</b> — порог абсолютного изменения в рублях"
     )
 
-    monitor_id = _parse_monitor_id(item.get("id")) or "—"
-    return (
-        f"✏️ <b>Редактирование мониторинга #{monitor_id}</b>\n"
-        f"Инструмент: <b>{html.escape(str(item.get('ticker') or item.get('figi') or '—'))}</b>\n"
-        f"Текущий порог: <b>{_to_clean_num_str(item.get('threshold_percent'), '%')}</b> или <b>{_to_clean_num_str(item.get('threshold_rub'))} RUB</b>\n\n"
-        ",  :"
-    )
-
 
 def _profile_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Обновить токен/account_id", callback_data=PROF_CB_UPDATE)],
             [InlineKeyboardButton(text="Проверить доступ", callback_data=PROF_CB_CHECK)],
-        ]
-    )
-
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=" ", callback_data=PROF_CB_UPDATE)],
-            [InlineKeyboardButton(text=" ", callback_data=PROF_CB_CHECK)],
         ]
     )

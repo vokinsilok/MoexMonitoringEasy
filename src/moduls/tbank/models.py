@@ -96,7 +96,7 @@ class TBankPriceMonitor(Base):
     figi: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     ticker: Mapped[str | None] = mapped_column(String(32), nullable=True)
     instrument_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    interval_minutes: Mapped[int] = mapped_column(nullable=False, default=5)
+    interval_seconds: Mapped[int] = mapped_column(nullable=False, default=300)
     threshold_percent: Mapped[Decimal] = mapped_column(Numeric(10, 4), nullable=False)
     threshold_rub: Mapped[Decimal] = mapped_column(Numeric(20, 9), nullable=False)
     base_price: Mapped[Decimal] = mapped_column(Numeric(20, 9), nullable=False)

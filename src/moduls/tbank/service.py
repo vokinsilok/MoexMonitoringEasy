@@ -779,7 +779,7 @@ class TBankMonitorService:
             figi=payload.figi.strip(),
             ticker=payload.ticker,
             instrument_name=payload.instrument_name,
-            interval_minutes=payload.interval_minutes,
+            interval_seconds=payload.interval_seconds,
             threshold_percent=Decimal(payload.threshold_percent),
             threshold_rub=Decimal(payload.threshold_rub),
             base_price=Decimal(payload.base_price),
@@ -850,7 +850,7 @@ class TBankMonitorService:
 
             if row.last_checked_at_msk is not None:
                 delta = now_msk - row.last_checked_at_msk
-                if delta.total_seconds() < row.interval_minutes * 60:
+                if delta.total_seconds() < row.interval_seconds:
                     continue
 
             due_rows.append(row)
@@ -885,7 +885,7 @@ class TBankMonitorService:
             if hit:
                 can_notify = True
                 if row.last_notified_at_msk is not None:
-                    can_notify = (now_msk - row.last_notified_at_msk).total_seconds() >= row.interval_minutes * 60
+                    can_notify = (now_msk - row.last_notified_at_msk).total_seconds() >= row.interval_seconds
                 if can_notify:
                     await self.db.tbank_price_monitor.touch_notified(row.id, now_msk)
                     events.append(
@@ -941,7 +941,7 @@ class TBankMonitorService:
             figi=row.figi,
             ticker=row.ticker,
             instrument_name=row.instrument_name,
-            interval_minutes=row.interval_minutes,
+            interval_seconds=row.interval_seconds,
             threshold_percent=row.threshold_percent,
             threshold_rub=row.threshold_rub,
             base_price=row.base_price,

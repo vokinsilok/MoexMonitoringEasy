@@ -164,7 +164,7 @@ class TBankFavoriteSharesResponse(BaseModel):
 class TBankMonitorCreateRequest(BaseModel):
     telegram_user_id: int = Field(..., ge=1)
     figi: str = Field(..., min_length=1)
-    interval_minutes: int = Field(..., ge=1, le=1440)
+    interval_seconds: int = Field(..., ge=5, le=86400)
     threshold_percent: str = Field(..., min_length=1)
     threshold_rub: str = Field(..., min_length=1)
     base_price: str = Field(..., min_length=1)
@@ -201,7 +201,7 @@ class TBankMonitorItem(BaseModel):
     figi: str
     ticker: str | None = None
     instrument_name: str | None = None
-    interval_minutes: int
+    interval_seconds: int
     threshold_percent: Any
     threshold_rub: Any
     base_price: Any
