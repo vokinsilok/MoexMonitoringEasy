@@ -1070,7 +1070,7 @@ async def _admin_show_panel(message: Message, *, edit: bool = False) -> None:
         "Здесь можно:\n"
         "• одобрять заявки на доступ\n"
         "• отзывать доступ у пользователей\n"
-        "• смотреть список пользователей (без админов)"
+        "• смотреть список пользователей"
     )
     if edit:
         await _safe_edit_text(message, text, reply_markup=_admin_panel_keyboard())

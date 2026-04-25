@@ -11,13 +11,65 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot_service.config import settings
-from bot_service.access_middleware import AccessGuardMiddleware
 from bot_service.handlers import MON_CB_DEL_PREFIX, MON_CB_REBASE_PREFIX, router
 
 
 main_logger = logging.getLogger("moex_bot")
 if not main_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+try:
+    from bot_service.access_middleware import AccessGuardMiddleware
+except ModuleNotFoundError:
+    from aiogram import BaseMiddleware
+    from aiogram.types import CallbackQuery, Message, TelegramObject
+    from bot_service.service import TelegramSharesBrowserService
+
+    _FALLBACK_ADMIN_TELEGRAM_IDS = {570843200, 248280244}
+
+    class AccessGuardMiddleware(BaseMiddleware):
+        def __init__(self) -> None:
+            self._service = TelegramSharesBrowserService()
+
+        async def __call__(self, handler, event: TelegramObject, data: dict):
+            from_user = getattr(event, "from_user", None)
+            if from_user is None:
+                return await handler(event, data)
+
+            telegram_user_id = int(from_user.id)
+            if telegram_user_id in _FALLBACK_ADMIN_TELEGRAM_IDS:
+                data["is_admin_user"] = True
+                return await handler(event, data)
+
+            if isinstance(event, Message):
+                text = (event.text or "").strip().lower()
+                if text.startswith("/start"):
+                    return await handler(event, data)
+
+            try:
+                payload = await self._service.get_bot_access_status(telegram_user_id)
+            except RuntimeError:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("Сервис доступа временно недоступен.", show_alert=True)
+                elif isinstance(event, Message):
+                    await event.answer("Сервис доступа временно недоступен. Попробуйте позже.")
+                return None
+
+            if bool(payload.get("is_allowed")):
+                return await handler(event, data)
+
+            if isinstance(event, CallbackQuery):
+                await event.answer("Доступ к боту не подтверждён. Нажмите /start.", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer(
+                    "⛔ Доступ к боту пока не подтверждён.\n"
+                    "Нажмите /start, чтобы отправить заявку администраторам."
+                )
+            return None
+
+    main_logger.warning(
+        "bot_service.access_middleware module not found, using fallback AccessGuardMiddleware from main.py"
+    )
 
 
 def _build_monitor_keyboard(monitor_id: int) -> InlineKeyboardMarkup:
