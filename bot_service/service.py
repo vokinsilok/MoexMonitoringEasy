@@ -177,6 +177,65 @@ class TelegramSharesBrowserService:
             f"/api/v1/tbank/users/{telegram_user_id}/credentials/status"
         )
 
+    async def get_bot_access_status(self, telegram_user_id: int) -> dict:
+        return await self._get_payload(f"/api/v1/tbank/bot-access/status?telegram_user_id={telegram_user_id}")
+
+    async def request_bot_access(
+        self,
+        telegram_user_id: int,
+        *,
+        username: str | None,
+        first_name: str | None,
+        last_name: str | None,
+    ) -> dict:
+        return await self._post_payload(
+            "/api/v1/tbank/bot-access/request",
+            {
+                "telegram_user_id": telegram_user_id,
+                "username": username,
+                "first_name": first_name,
+                "last_name": last_name,
+            },
+        )
+
+    async def approve_bot_access(self, telegram_user_id: int, admin_telegram_user_id: int) -> dict:
+        return await self._post_payload(
+            "/api/v1/tbank/bot-access/approve",
+            {
+                "telegram_user_id": telegram_user_id,
+                "admin_telegram_user_id": admin_telegram_user_id,
+            },
+        )
+
+    async def revoke_bot_access(self, telegram_user_id: int, admin_telegram_user_id: int) -> dict:
+        return await self._post_payload(
+            "/api/v1/tbank/bot-access/revoke",
+            {
+                "telegram_user_id": telegram_user_id,
+                "admin_telegram_user_id": admin_telegram_user_id,
+            },
+        )
+
+    async def list_pending_bot_access(self, limit: int = 100, offset: int = 0) -> dict:
+        return await self._get_payload(
+            f"/api/v1/tbank/bot-access/pending?limit={limit}&offset={offset}"
+        )
+
+    async def list_bot_access_users(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        exclude_telegram_user_ids: list[int] | None = None,
+    ) -> dict:
+        query = f"limit={limit}&offset={offset}"
+        if exclude_telegram_user_ids:
+            extras = "&".join(
+                [f"exclude_telegram_user_ids={int(user_id)}" for user_id in exclude_telegram_user_ids]
+            )
+            query = f"{query}&{extras}"
+        return await self._get_payload(f"/api/v1/tbank/bot-access/users?{query}")
+
     async def create_monitor(
         self,
         *,

@@ -8,6 +8,10 @@ from src.core.config import settings
 from src.init import redis_manager
 from src.moduls.tbank.schemas import (
     TBankAllowedSectorsResponse,
+    TBankBotAccessActionRequest,
+    TBankBotAccessListResponse,
+    TBankBotAccessRequest,
+    TBankBotAccessStatusResponse,
     TBankFavoriteShareRequest,
     TBankFavoriteSharesResponse,
     TBankMonitorCheckResponse,
@@ -69,6 +73,38 @@ async def _build_user_trading_service(db: DBDep, telegram_user_id: int) -> TBank
         ca_bundle_path=settings.TBANK_INVEST_CA_BUNDLE_PATH,
     )
     return TBankTradingService(connector=connector, account_id=creds.tbank_account_id)
+
+
+def _to_bot_access_status_response(row, *, default_user_id: int | None = None) -> TBankBotAccessStatusResponse:
+    if row is None:
+        return TBankBotAccessStatusResponse(
+            telegram_user_id=int(default_user_id or 0),
+            username=None,
+            first_name=None,
+            last_name=None,
+            status="none",
+            is_allowed=False,
+            requested_at=None,
+            approved_at=None,
+            revoked_at=None,
+            approved_by=None,
+            revoked_by=None,
+        )
+
+    status = str(getattr(row, "status", "none") or "none").strip().lower()
+    return TBankBotAccessStatusResponse(
+        telegram_user_id=int(getattr(row, "telegram_user_id", 0) or 0),
+        username=getattr(row, "username", None),
+        first_name=getattr(row, "first_name", None),
+        last_name=getattr(row, "last_name", None),
+        status=status,
+        is_allowed=(status == "approved"),
+        requested_at=getattr(row, "requested_at", None),
+        approved_at=getattr(row, "approved_at", None),
+        revoked_at=getattr(row, "revoked_at", None),
+        approved_by=getattr(row, "approved_by", None),
+        revoked_by=getattr(row, "revoked_by", None),
+    )
 
 
 @tbank_router.get(
@@ -269,6 +305,99 @@ async def get_user_credentials_status(
         telegram_user_id=telegram_user_id,
         configured=True,
         tbank_account_id=creds.tbank_account_id,
+    )
+
+
+@tbank_router.post(
+    "/bot-access/request",
+    response_model=TBankBotAccessStatusResponse,
+    summary="Создать/обновить заявку на доступ к Telegram-боту",
+)
+async def request_bot_access(payload: TBankBotAccessRequest, db: AtomicDBDep) -> TBankBotAccessStatusResponse:
+    row = await db.tbank_bot_access_user.upsert_request(
+        telegram_user_id=payload.telegram_user_id,
+        username=(payload.username.strip() if payload.username else None),
+        first_name=(payload.first_name.strip() if payload.first_name else None),
+        last_name=(payload.last_name.strip() if payload.last_name else None),
+    )
+    return _to_bot_access_status_response(row)
+
+
+@tbank_router.get(
+    "/bot-access/status",
+    response_model=TBankBotAccessStatusResponse,
+    summary="Получить статус доступа пользователя к Telegram-боту",
+)
+async def get_bot_access_status(
+    db: DBDep,
+    telegram_user_id: int = Query(..., ge=1),
+) -> TBankBotAccessStatusResponse:
+    row = await db.tbank_bot_access_user.get_by_telegram_user_id(telegram_user_id)
+    return _to_bot_access_status_response(row, default_user_id=telegram_user_id)
+
+
+@tbank_router.post(
+    "/bot-access/approve",
+    response_model=TBankBotAccessStatusResponse,
+    summary="Выдать доступ к Telegram-боту пользователю",
+)
+async def approve_bot_access(payload: TBankBotAccessActionRequest, db: AtomicDBDep) -> TBankBotAccessStatusResponse:
+    row = await db.tbank_bot_access_user.approve(
+        telegram_user_id=payload.telegram_user_id,
+        admin_telegram_user_id=payload.admin_telegram_user_id,
+    )
+    return _to_bot_access_status_response(row)
+
+
+@tbank_router.post(
+    "/bot-access/revoke",
+    response_model=TBankBotAccessStatusResponse,
+    summary="Отозвать доступ к Telegram-боту у пользователя",
+)
+async def revoke_bot_access(payload: TBankBotAccessActionRequest, db: AtomicDBDep) -> TBankBotAccessStatusResponse:
+    row = await db.tbank_bot_access_user.revoke(
+        telegram_user_id=payload.telegram_user_id,
+        admin_telegram_user_id=payload.admin_telegram_user_id,
+    )
+    return _to_bot_access_status_response(row)
+
+
+@tbank_router.get(
+    "/bot-access/pending",
+    response_model=TBankBotAccessListResponse,
+    summary="Список заявок на доступ к Telegram-боту",
+)
+async def list_pending_bot_access(
+    db: DBDep,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> TBankBotAccessListResponse:
+    rows, total = await db.tbank_bot_access_user.list_pending(limit=limit, offset=offset)
+    return TBankBotAccessListResponse(
+        total=total,
+        items=[_to_bot_access_status_response(row) for row in rows],
+    )
+
+
+@tbank_router.get(
+    "/bot-access/users",
+    response_model=TBankBotAccessListResponse,
+    summary="Список пользователей Telegram-бота",
+)
+async def list_bot_access_users(
+    db: DBDep,
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    exclude_telegram_user_ids: list[int] = Query(default=[]),
+) -> TBankBotAccessListResponse:
+    rows, total = await db.tbank_bot_access_user.list_users(
+        limit=limit,
+        offset=offset,
+        exclude_telegram_user_ids=exclude_telegram_user_ids,
+    )
+    return TBankBotAccessListResponse(
+        total=total,
+        items=[_to_bot_access_status_response(row) for row in rows],
     )
 
 

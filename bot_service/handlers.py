@@ -34,6 +34,7 @@ from bot_service.keyboards import (
     share_details_keyboard,
     shares_list_keyboard,
 )
+from bot_service.access import ADMIN_TELEGRAM_IDS, is_admin_user
 from bot_service.models import ShareViewItem
 from bot_service.service import TelegramSharesBrowserService
 from bot_service.states import SharesBrowserStates
@@ -52,6 +53,7 @@ MENU_PROFILE = "🔐 Профиль T-Bank"
 MENU_ORDER = "🧾 Заявка"
 MENU_STOP = "🛑 Стоп-приказ"
 MENU_ACTIVE_ORDERS = "📂 Активные заявки"
+MENU_ADMIN = "🛡 Админка"
 
 ORDER_TYPE_LIMIT_LABEL = "Лимитная"
 ORDER_TYPE_MARKET_LABEL = "Рыночная"
@@ -79,6 +81,17 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+MAIN_MENU_KEYBOARD_ADMIN = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text=MENU_SHARES), KeyboardButton(text=MENU_NEW_MONITOR)],
+        [KeyboardButton(text=MENU_MONITORS), KeyboardButton(text=MENU_PORTFOLIO)],
+        [KeyboardButton(text=MENU_OPERATIONS), KeyboardButton(text=MENU_PROFILE)],
+        [KeyboardButton(text=MENU_ORDER), KeyboardButton(text=MENU_STOP)],
+        [KeyboardButton(text=MENU_ACTIVE_ORDERS), KeyboardButton(text=MENU_ADMIN)],
+    ],
+    resize_keyboard=True,
+)
+
 MON_CB_LIST = "mon:list"
 MON_CB_REFRESH = "mon:refresh"
 MON_CB_ITEM_PREFIX = "mon:item"
@@ -95,6 +108,13 @@ PROF_CB_CHECK = "prof:check"
 AO_CB_REFRESH = "ao:refresh"
 AO_CB_CANCEL_ORDER_PREFIX = "ao:cancel_order"
 AO_CB_CANCEL_STOP_PREFIX = "ao:cancel_stop"
+ADM_CB_PANEL = "adm:panel"
+ADM_CB_PENDING = "adm:pending"
+ADM_CB_USERS = "adm:users"
+ADM_CB_REFRESH = "adm:refresh"
+ADM_CB_USER_PREFIX = "adm:user"
+ADM_CB_APPROVE_PREFIX = "adm:approve"
+ADM_CB_REVOKE_PREFIX = "adm:revoke"
 
 
 async def _safe_telegram_call(coro):
@@ -128,6 +148,157 @@ async def _safe_delete_by_id(message: Message, message_id: int | None) -> None:
         await message.bot.delete_message(chat_id=message.chat.id, message_id=message_id)
     except Exception:
         return
+
+
+def _menu_keyboard_for_user(telegram_user_id: int | None) -> ReplyKeyboardMarkup:
+    if is_admin_user(telegram_user_id):
+        return MAIN_MENU_KEYBOARD_ADMIN
+    return MAIN_MENU_KEYBOARD
+
+
+def _access_status_badge(status: str | None) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "approved":
+        return "✅"
+    if normalized == "pending":
+        return "⏳"
+    if normalized == "revoked":
+        return "⛔"
+    return "⚪"
+
+
+def _display_user_name(item: dict) -> str:
+    first_name = str(item.get("first_name") or "").strip()
+    last_name = str(item.get("last_name") or "").strip()
+    username = str(item.get("username") or "").strip()
+    full_name = " ".join(part for part in [first_name, last_name] if part).strip()
+    if full_name:
+        return full_name
+    if username:
+        return f"@{username}"
+    return "Без имени"
+
+
+def _admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📥 Заявки", callback_data=ADM_CB_PENDING)],
+            [InlineKeyboardButton(text="👥 Пользователи", callback_data=ADM_CB_USERS)],
+            [InlineKeyboardButton(text="🔄 Обновить", callback_data=ADM_CB_REFRESH)],
+        ]
+    )
+
+
+def _admin_user_actions_keyboard(telegram_user_id: int, status: str | None) -> InlineKeyboardMarkup:
+    normalized = str(status or "").strip().lower()
+    approve_text = "✅ Одобрить доступ" if normalized != "approved" else "✅ Доступ выдан"
+    revoke_text = "⛔ Отозвать доступ" if normalized == "approved" else "⛔ Отклонить заявку"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=approve_text, callback_data=f"{ADM_CB_APPROVE_PREFIX}:{telegram_user_id}")],
+            [InlineKeyboardButton(text=revoke_text, callback_data=f"{ADM_CB_REVOKE_PREFIX}:{telegram_user_id}")],
+            [InlineKeyboardButton(text="📥 Заявки", callback_data=ADM_CB_PENDING)],
+            [InlineKeyboardButton(text="👥 Пользователи", callback_data=ADM_CB_USERS)],
+        ]
+    )
+
+
+def _admin_user_detail_text(item: dict) -> str:
+    telegram_user_id = int(item.get("telegram_user_id") or 0)
+    status = str(item.get("status") or "none")
+    name = _display_user_name(item)
+    username = str(item.get("username") or "").strip()
+    username_text = f"@{username}" if username else "—"
+    return (
+        "🛡 <b>Пользователь бота</b>\n"
+        f"ID: <code>{telegram_user_id}</code>\n"
+        f"Имя: <b>{html.escape(name)}</b>\n"
+        f"Username: <b>{html.escape(username_text)}</b>\n"
+        f"Статус: <b>{_access_status_badge(status)} {html.escape(status)}</b>\n"
+        f"Заявка: <b>{_format_datetime(str(item.get('requested_at') or ''))}</b>\n"
+        f"Одобрен: <b>{_format_datetime(str(item.get('approved_at') or ''))}</b>\n"
+        f"Отозван: <b>{_format_datetime(str(item.get('revoked_at') or ''))}</b>"
+    )
+
+
+def _admin_users_list_text(items: list[dict], *, title: str, total: int) -> str:
+    lines = [f"🛡 <b>{title}</b>", f"Всего: <b>{total}</b>", ""]
+    if not items:
+        lines.append("Список пуст.")
+        return "\n".join(lines)
+    for idx, item in enumerate(items[:30], start=1):
+        telegram_user_id = int(item.get("telegram_user_id") or 0)
+        status = str(item.get("status") or "none")
+        lines.append(
+            f"{idx}. {_access_status_badge(status)} <code>{telegram_user_id}</code> · {html.escape(_display_user_name(item))}"
+        )
+    if len(items) > 30:
+        lines.append("")
+        lines.append("Показаны первые 30 записей.")
+    lines.append("")
+    lines.append("Нажмите на пользователя в кнопках ниже.")
+    return "\n".join(lines)
+
+
+def _admin_users_list_keyboard(items: list[dict]) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in items[:20]:
+        telegram_user_id = int(item.get("telegram_user_id") or 0)
+        if telegram_user_id <= 0:
+            continue
+        status = str(item.get("status") or "none")
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{_access_status_badge(status)} {telegram_user_id} · {_display_user_name(item)[:24]}",
+                    callback_data=f"{ADM_CB_USER_PREFIX}:{telegram_user_id}",
+                )
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="📥 Заявки", callback_data=ADM_CB_PENDING)])
+    rows.append([InlineKeyboardButton(text="👥 Пользователи", callback_data=ADM_CB_USERS)])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data=ADM_CB_REFRESH)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _admin_request_keyboard(telegram_user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Одобрить",
+                    callback_data=f"{ADM_CB_APPROVE_PREFIX}:{telegram_user_id}",
+                ),
+                InlineKeyboardButton(
+                    text="⛔ Отклонить",
+                    callback_data=f"{ADM_CB_REVOKE_PREFIX}:{telegram_user_id}",
+                ),
+            ],
+            [InlineKeyboardButton(text="Открыть карточку", callback_data=f"{ADM_CB_USER_PREFIX}:{telegram_user_id}")],
+        ]
+    )
+
+
+async def _notify_admins_access_request(message: Message, access_item: dict) -> None:
+    if not message.from_user:
+        return
+    telegram_user_id = int(access_item.get("telegram_user_id") or message.from_user.id)
+    name = _display_user_name(access_item)
+    text = (
+        "🆕 <b>Новая заявка на доступ к боту</b>\n"
+        f"ID: <code>{telegram_user_id}</code>\n"
+        f"Имя: <b>{html.escape(name)}</b>\n"
+        f"Username: <b>{html.escape('@' + message.from_user.username if message.from_user.username else '—')}</b>\n"
+        "Выберите действие:"
+    )
+    for admin_id in sorted(ADMIN_TELEGRAM_IDS):
+        await _safe_telegram_call(
+            message.bot.send_message(
+                chat_id=admin_id,
+                text=text,
+                reply_markup=_admin_request_keyboard(telegram_user_id),
+            )
+        )
 
 
 def _list_header(total: int, page: int, total_pages: int) -> str:
@@ -403,6 +574,17 @@ def _parse_monitor_id(value: object) -> int | None:
         return None
 
 
+def _parse_callback_user_id(data: str | None, prefix: str) -> int | None:
+    raw = str(data or "")
+    if not raw.startswith(f"{prefix}:"):
+        return None
+    value = raw.rsplit(":", maxsplit=1)[-1].strip()
+    if not value.isdigit():
+        return None
+    user_id = int(value)
+    return user_id if user_id > 0 else None
+
+
 def _find_monitor_item(items: list[dict], monitor_id: int) -> dict | None:
     for item in items:
         if not isinstance(item, dict):
@@ -447,7 +629,7 @@ async def _show_monitor_list_message(message: Message) -> None:
                 "🧭 <b>Мои мониторинги</b>\n"
                 "Пока ничего нет.\n\n"
                 "Создайте первый через «🔔 Новый мониторинг».",
-                reply_markup=MAIN_MENU_KEYBOARD,
+                reply_markup=_menu_keyboard_for_user(message.from_user.id if message.from_user else None),
             )
         )
         return
@@ -476,6 +658,7 @@ MAIN_MENU_TEXTS = {
     MENU_ORDER,
     MENU_STOP,
     MENU_ACTIVE_ORDERS,
+    MENU_ADMIN,
 }
 
 MAIN_MENU_TEXTS_NORMALIZED = {text.strip().casefold() for text in MAIN_MENU_TEXTS}
@@ -814,12 +997,53 @@ async def _edit_page(callback: CallbackQuery, state: FSMContext, page: int, forc
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    telegram_user_id = message.from_user.id
+    if is_admin_user(telegram_user_id):
+        await _safe_telegram_call(
+            message.answer(
+                "Привет! Это MoexMonitoring.\n"
+                "У вас роль администратора доступа. Управление доступом — в разделе «🛡 Админка».",
+                reply_markup=_menu_keyboard_for_user(telegram_user_id),
+            )
+        )
+        return
+
+    try:
+        access = await service.get_bot_access_status(telegram_user_id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(message.answer(f"Не удалось проверить доступ: {exc}"))
+        return
+
+    if bool(access.get("is_allowed")):
+        await _safe_telegram_call(
+            message.answer(
+                "Привет! Это MoexMonitoring.\nВыберите раздел в меню ниже.",
+                reply_markup=_menu_keyboard_for_user(telegram_user_id),
+            )
+        )
+        return
+
+    try:
+        requested = await service.request_bot_access(
+            telegram_user_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name,
+            last_name=message.from_user.last_name,
+        )
+    except RuntimeError as exc:
+        await _safe_telegram_call(message.answer(f"Не удалось отправить заявку на доступ: {exc}"))
+        return
+
     await _safe_telegram_call(
         message.answer(
-            "Привет! Это MoexMonitoring.\nВыберите раздел в меню ниже.",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            "⏳ Доступ к боту пока не выдан.\n"
+            "Заявка отправлена администраторам, дождитесь одобрения.",
         )
     )
+    await _notify_admins_access_request(message, requested)
     return
 
 
@@ -833,7 +1057,203 @@ async def menu_interrupt_router(message: Message, state: FSMContext) -> None:
 async def cancel_current_flow(message: Message, state: FSMContext) -> None:
     await state.clear()
     await _safe_telegram_call(
-        message.answer("Текущее действие отменено.", reply_markup=MAIN_MENU_KEYBOARD)
+        message.answer(
+            "Текущее действие отменено.",
+            reply_markup=_menu_keyboard_for_user(message.from_user.id if message.from_user else None),
+        )
+    )
+
+
+async def _admin_show_panel(message: Message, *, edit: bool = False) -> None:
+    text = (
+        "🛡 <b>Админка доступа</b>\n"
+        "Здесь можно:\n"
+        "• одобрять заявки на доступ\n"
+        "• отзывать доступ у пользователей\n"
+        "• смотреть список пользователей (без админов)"
+    )
+    if edit:
+        await _safe_edit_text(message, text, reply_markup=_admin_panel_keyboard())
+    else:
+        await _safe_telegram_call(message.answer(text, reply_markup=_admin_panel_keyboard()))
+
+
+async def _admin_show_pending_list(message: Message, *, edit: bool = False) -> None:
+    try:
+        payload = await service.list_pending_bot_access(limit=100, offset=0)
+    except RuntimeError as exc:
+        await _safe_telegram_call(message.answer(f"Не удалось загрузить заявки: {exc}"))
+        return
+    items = payload.get("items", [])
+    safe_items = items if isinstance(items, list) else []
+    total = int(payload.get("total") or len(safe_items))
+    text = _admin_users_list_text(safe_items, title="Заявки на доступ", total=total)
+    keyboard = _admin_users_list_keyboard(safe_items)
+    if edit:
+        await _safe_edit_text(message, text, reply_markup=keyboard)
+    else:
+        await _safe_telegram_call(message.answer(text, reply_markup=keyboard))
+
+
+async def _admin_show_users_list(message: Message, *, edit: bool = False) -> None:
+    try:
+        payload = await service.list_bot_access_users(
+            limit=200,
+            offset=0,
+            exclude_telegram_user_ids=sorted(ADMIN_TELEGRAM_IDS),
+        )
+    except RuntimeError as exc:
+        await _safe_telegram_call(message.answer(f"Не удалось загрузить пользователей: {exc}"))
+        return
+    items = payload.get("items", [])
+    safe_items = items if isinstance(items, list) else []
+    total = int(payload.get("total") or len(safe_items))
+    text = _admin_users_list_text(safe_items, title="Пользователи бота", total=total)
+    keyboard = _admin_users_list_keyboard(safe_items)
+    if edit:
+        await _safe_edit_text(message, text, reply_markup=keyboard)
+    else:
+        await _safe_telegram_call(message.answer(text, reply_markup=keyboard))
+
+
+async def _admin_show_user_details(message: Message, telegram_user_id: int, *, edit: bool = False) -> None:
+    try:
+        payload = await service.get_bot_access_status(telegram_user_id)
+    except RuntimeError as exc:
+        await _safe_telegram_call(message.answer(f"Не удалось загрузить пользователя: {exc}"))
+        return
+    text = _admin_user_detail_text(payload)
+    keyboard = _admin_user_actions_keyboard(telegram_user_id, str(payload.get("status") or "none"))
+    if edit:
+        await _safe_edit_text(message, text, reply_markup=keyboard)
+    else:
+        await _safe_telegram_call(message.answer(text, reply_markup=keyboard))
+
+
+@router.message(Command("admin"))
+@router.message(F.text == MENU_ADMIN)
+async def admin_panel_start(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not is_admin_user(message.from_user.id):
+        await _safe_telegram_call(message.answer("Доступ к админке запрещен."))
+        return
+    await state.clear()
+    await _safe_telegram_call(
+        message.answer(
+            "Открываю админку доступа.",
+            reply_markup=_menu_keyboard_for_user(message.from_user.id),
+        )
+    )
+    await _admin_show_panel(message, edit=False)
+
+
+@router.callback_query(F.data == ADM_CB_PANEL)
+async def admin_panel_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer())
+    if not callback.from_user or not callback.message or not is_admin_user(callback.from_user.id):
+        await _safe_telegram_call(callback.answer("Нет доступа", show_alert=True))
+        return
+    await _admin_show_panel(callback.message, edit=True)
+
+
+@router.callback_query(F.data == ADM_CB_PENDING)
+async def admin_pending_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer("Загружаю заявки..."))
+    if not callback.from_user or not callback.message or not is_admin_user(callback.from_user.id):
+        await _safe_telegram_call(callback.answer("Нет доступа", show_alert=True))
+        return
+    await _admin_show_pending_list(callback.message, edit=True)
+
+
+@router.callback_query(F.data == ADM_CB_USERS)
+async def admin_users_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer("Загружаю пользователей..."))
+    if not callback.from_user or not callback.message or not is_admin_user(callback.from_user.id):
+        await _safe_telegram_call(callback.answer("Нет доступа", show_alert=True))
+        return
+    await _admin_show_users_list(callback.message, edit=True)
+
+
+@router.callback_query(F.data == ADM_CB_REFRESH)
+async def admin_refresh_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer("Обновляю..."))
+    if not callback.from_user or not callback.message or not is_admin_user(callback.from_user.id):
+        await _safe_telegram_call(callback.answer("Нет доступа", show_alert=True))
+        return
+    await _admin_show_panel(callback.message, edit=True)
+
+
+@router.callback_query(F.data.startswith(f"{ADM_CB_USER_PREFIX}:"))
+async def admin_user_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer())
+    if not callback.from_user or not callback.message or not is_admin_user(callback.from_user.id):
+        await _safe_telegram_call(callback.answer("Нет доступа", show_alert=True))
+        return
+    telegram_user_id = _parse_callback_user_id(callback.data, ADM_CB_USER_PREFIX)
+    if not telegram_user_id:
+        await _safe_telegram_call(callback.answer("Некорректный ID", show_alert=True))
+        return
+    await _admin_show_user_details(callback.message, telegram_user_id, edit=True)
+
+
+@router.callback_query(F.data.startswith(f"{ADM_CB_APPROVE_PREFIX}:"))
+async def admin_approve_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer())
+    if not callback.from_user or not callback.message or not is_admin_user(callback.from_user.id):
+        await _safe_telegram_call(callback.answer("Нет доступа", show_alert=True))
+        return
+    telegram_user_id = _parse_callback_user_id(callback.data, ADM_CB_APPROVE_PREFIX)
+    if not telegram_user_id:
+        await _safe_telegram_call(callback.answer("Некорректный ID", show_alert=True))
+        return
+    try:
+        payload = await service.approve_bot_access(
+            telegram_user_id=telegram_user_id,
+            admin_telegram_user_id=callback.from_user.id,
+        )
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.answer(f"Не удалось выдать доступ: {exc}", show_alert=True))
+        return
+    await _safe_telegram_call(
+        callback.bot.send_message(
+            chat_id=telegram_user_id,
+            text="✅ Доступ к боту выдан. Нажмите /start, чтобы открыть меню.",
+        )
+    )
+    await _safe_edit_text(
+        callback.message,
+        _admin_user_detail_text(payload),
+        reply_markup=_admin_user_actions_keyboard(telegram_user_id, str(payload.get("status") or "approved")),
+    )
+
+
+@router.callback_query(F.data.startswith(f"{ADM_CB_REVOKE_PREFIX}:"))
+async def admin_revoke_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer())
+    if not callback.from_user or not callback.message or not is_admin_user(callback.from_user.id):
+        await _safe_telegram_call(callback.answer("Нет доступа", show_alert=True))
+        return
+    telegram_user_id = _parse_callback_user_id(callback.data, ADM_CB_REVOKE_PREFIX)
+    if not telegram_user_id:
+        await _safe_telegram_call(callback.answer("Некорректный ID", show_alert=True))
+        return
+    try:
+        payload = await service.revoke_bot_access(
+            telegram_user_id=telegram_user_id,
+            admin_telegram_user_id=callback.from_user.id,
+        )
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.answer(f"Не удалось отозвать доступ: {exc}", show_alert=True))
+        return
+    await _safe_telegram_call(
+        callback.bot.send_message(
+            chat_id=telegram_user_id,
+            text="⛔ Доступ к боту отозван администратором.",
+        )
+    )
+    await _safe_edit_text(
+        callback.message,
+        _admin_user_detail_text(payload),
+        reply_markup=_admin_user_actions_keyboard(telegram_user_id, str(payload.get("status") or "revoked")),
     )
 
 
@@ -968,7 +1388,7 @@ async def profile_set_account_id(message: Message, state: FSMContext) -> None:
     await _safe_telegram_call(
         message.answer(
             f"✅ Профиль сохранен.\nTelegram ID: <b>{message.from_user.id}</b>\nРеквизиты обновлены и скрыты из чата.",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_menu_keyboard_for_user(message.from_user.id),
         )
     )
     return
@@ -1122,7 +1542,7 @@ async def monitor_finish(message: Message, state: FSMContext) -> None:
             f"Инструмент: <b>{details.get('ticker') or details.get('figi')}</b>\n"
             f"Интервал: <b>{_format_interval_seconds(interval_value)}</b>\n"
             f"Порог: <b>{details.get('threshold_percent')}%</b> или <b>{details.get('threshold_rub')} RUB</b>",
-            reply_markup=MAIN_MENU_KEYBOARD,
+            reply_markup=_menu_keyboard_for_user(message.from_user.id),
         )
     )
     return
@@ -1424,7 +1844,12 @@ async def _apply_monitor_edit_value(message: Message, state: FSMContext, target:
     monitor_id = _parse_monitor_id(data.get("edit_monitor_id"))
     if not monitor_id:
         await state.clear()
-        await _safe_telegram_call(message.answer("   .", reply_markup=MAIN_MENU_KEYBOARD))
+        await _safe_telegram_call(
+            message.answer(
+                "   .",
+                reply_markup=_menu_keyboard_for_user(message.from_user.id if message.from_user else None),
+            )
+        )
         return
 
     try:
@@ -1435,7 +1860,12 @@ async def _apply_monitor_edit_value(message: Message, state: FSMContext, target:
 
     if item is None:
         await state.clear()
-        await _safe_telegram_call(message.answer("  .", reply_markup=MAIN_MENU_KEYBOARD))
+        await _safe_telegram_call(
+            message.answer(
+                "  .",
+                reply_markup=_menu_keyboard_for_user(message.from_user.id if message.from_user else None),
+            )
+        )
         return
 
     current_percent = str(item.get("threshold_percent"))
@@ -2268,8 +2698,6 @@ async def menu_fallback_router(message: Message, state: FSMContext) -> None:
 
 async def _open_menu_section(message: Message, state: FSMContext, text: str) -> None:
     await state.clear()
-    normalized = (text or "").strip().lower()
-
     normalized_text = (text or "").strip()
     if _menu_text_equals(normalized_text, MENU_SHARES):
         await open_shares(message, state)
@@ -2297,6 +2725,9 @@ async def _open_menu_section(message: Message, state: FSMContext, text: str) -> 
         return
     if _menu_text_equals(normalized_text, MENU_ACTIVE_ORDERS):
         await open_active_orders(message)
+        return
+    if _menu_text_equals(normalized_text, MENU_ADMIN):
+        await admin_panel_start(message, state)
         return
 
     return

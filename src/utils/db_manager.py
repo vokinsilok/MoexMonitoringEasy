@@ -8,6 +8,7 @@ class DBManager:
     async def __aenter__(self):
         self.session = self.session_factory()
         from src.moduls.tbank.repository import (
+            TBankBotAccessUserRepository,
             TBankFavoriteShareRepository,
             TBankPriceMonitorRepository,
             TBankShareRepository,
@@ -17,6 +18,7 @@ class DBManager:
         self.tbank_share = TBankShareRepository(self.session)
         self.tbank_user_credential = TBankUserCredentialRepository(self.session)
         self.tbank_favorite_share = TBankFavoriteShareRepository(self.session)
+        self.tbank_bot_access_user = TBankBotAccessUserRepository(self.session)
         self.tbank_price_monitor = TBankPriceMonitorRepository(self.session)
         return self
 

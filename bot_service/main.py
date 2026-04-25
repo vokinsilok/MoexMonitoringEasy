@@ -11,6 +11,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot_service.config import settings
+from bot_service.access_middleware import AccessGuardMiddleware
 from bot_service.handlers import MON_CB_DEL_PREFIX, MON_CB_REBASE_PREFIX, router
 
 
@@ -104,6 +105,9 @@ async def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not set")
 
     dispatcher = Dispatcher(storage=MemoryStorage())
+    access_guard = AccessGuardMiddleware()
+    dispatcher.message.outer_middleware(access_guard)
+    dispatcher.callback_query.outer_middleware(access_guard)
     dispatcher.include_router(router)
 
     retry_delay_seconds = 5

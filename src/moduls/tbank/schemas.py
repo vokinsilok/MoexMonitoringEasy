@@ -161,6 +161,37 @@ class TBankFavoriteSharesResponse(BaseModel):
     figies: list[str]
 
 
+class TBankBotAccessRequest(BaseModel):
+    telegram_user_id: int = Field(..., ge=1)
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+
+
+class TBankBotAccessActionRequest(BaseModel):
+    telegram_user_id: int = Field(..., ge=1)
+    admin_telegram_user_id: int = Field(..., ge=1)
+
+
+class TBankBotAccessStatusResponse(BaseModel):
+    telegram_user_id: int
+    username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+    status: str
+    is_allowed: bool
+    requested_at: Any = None
+    approved_at: Any = None
+    revoked_at: Any = None
+    approved_by: int | None = None
+    revoked_by: int | None = None
+
+
+class TBankBotAccessListResponse(BaseModel):
+    total: int
+    items: list[TBankBotAccessStatusResponse]
+
+
 class TBankMonitorCreateRequest(BaseModel):
     telegram_user_id: int = Field(..., ge=1)
     figi: str = Field(..., min_length=1)

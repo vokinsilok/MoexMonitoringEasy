@@ -5,6 +5,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.moduls.base.base import BaseRepository
 from src.moduls.tbank.models import (
+    TBankBotAccessUser,
     TBankFavoriteShare,
     TBankPriceMonitor,
     TBankShare,
@@ -193,6 +194,152 @@ class TBankFavoriteShareRepository(BaseRepository):
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none() is not None
+
+
+class TBankBotAccessUserRepository(BaseRepository):
+    model = TBankBotAccessUser
+
+    async def get_by_telegram_user_id(self, telegram_user_id: int) -> TBankBotAccessUser | None:
+        stmt = (
+            select(self.model)
+            .where(self.model.telegram_user_id == telegram_user_id)
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+
+    async def upsert_request(
+        self,
+        *,
+        telegram_user_id: int,
+        username: str | None,
+        first_name: str | None,
+        last_name: str | None,
+    ) -> TBankBotAccessUser:
+        now = datetime.now(timezone.utc)
+        insert_stmt = pg_insert(self.model).values(
+            telegram_user_id=telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            status="pending",
+            requested_at=now,
+            approved_at=None,
+            revoked_at=None,
+            approved_by=None,
+            revoked_by=None,
+            updated_at=now,
+        )
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[self.model.telegram_user_id],
+            set_={
+                "username": insert_stmt.excluded.username,
+                "first_name": insert_stmt.excluded.first_name,
+                "last_name": insert_stmt.excluded.last_name,
+                "status": "pending",
+                "requested_at": now,
+                "approved_at": None,
+                "revoked_at": None,
+                "approved_by": None,
+                "revoked_by": None,
+                "updated_at": now,
+            },
+        ).returning(self.model)
+        result = await self.session.execute(upsert_stmt)
+        return result.scalar_one()
+
+    async def approve(self, telegram_user_id: int, admin_telegram_user_id: int) -> TBankBotAccessUser:
+        now = datetime.now(timezone.utc)
+        insert_stmt = pg_insert(self.model).values(
+            telegram_user_id=telegram_user_id,
+            status="approved",
+            requested_at=now,
+            approved_at=now,
+            revoked_at=None,
+            approved_by=admin_telegram_user_id,
+            revoked_by=None,
+            updated_at=now,
+        )
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[self.model.telegram_user_id],
+            set_={
+                "status": "approved",
+                "approved_at": now,
+                "revoked_at": None,
+                "approved_by": admin_telegram_user_id,
+                "revoked_by": None,
+                "updated_at": now,
+            },
+        ).returning(self.model)
+        result = await self.session.execute(upsert_stmt)
+        return result.scalar_one()
+
+    async def revoke(self, telegram_user_id: int, admin_telegram_user_id: int) -> TBankBotAccessUser:
+        now = datetime.now(timezone.utc)
+        insert_stmt = pg_insert(self.model).values(
+            telegram_user_id=telegram_user_id,
+            status="revoked",
+            requested_at=now,
+            revoked_at=now,
+            approved_at=None,
+            revoked_by=admin_telegram_user_id,
+            approved_by=None,
+            updated_at=now,
+        )
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[self.model.telegram_user_id],
+            set_={
+                "status": "revoked",
+                "revoked_at": now,
+                "approved_at": None,
+                "revoked_by": admin_telegram_user_id,
+                "approved_by": None,
+                "updated_at": now,
+            },
+        ).returning(self.model)
+        result = await self.session.execute(upsert_stmt)
+        return result.scalar_one()
+
+    async def list_pending(self, limit: int = 100, offset: int = 0) -> tuple[list[TBankBotAccessUser], int]:
+        stmt = (
+            select(self.model)
+            .where(self.model.status == "pending")
+            .order_by(self.model.requested_at.desc(), self.model.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        rows = result.scalars().all()
+
+        count_stmt = select(func.count(self.model.id)).where(self.model.status == "pending")
+        count_result = await self.session.execute(count_stmt)
+        total = int(count_result.scalar_one())
+        return rows, total
+
+    async def list_users(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        exclude_telegram_user_ids: list[int] | None = None,
+    ) -> tuple[list[TBankBotAccessUser], int]:
+        excluded = [int(user_id) for user_id in (exclude_telegram_user_ids or [])]
+        stmt = select(self.model)
+        count_stmt = select(func.count(self.model.id))
+        if excluded:
+            stmt = stmt.where(~self.model.telegram_user_id.in_(excluded))
+            count_stmt = count_stmt.where(~self.model.telegram_user_id.in_(excluded))
+        stmt = (
+            stmt
+            .order_by(self.model.updated_at.desc(), self.model.id.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        rows = result.scalars().all()
+        count_result = await self.session.execute(count_stmt)
+        total = int(count_result.scalar_one())
+        return rows, total
 
 
 class TBankPriceMonitorRepository(BaseRepository):
