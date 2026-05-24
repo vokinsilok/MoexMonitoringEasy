@@ -108,19 +108,20 @@ class TBankStopOrderCreateRequest(BaseModel):
     telegram_user_id: int = Field(..., ge=1)
     figi: str = Field(..., min_length=1)
     quantity_lots: int = Field(..., ge=1)
-    direction: str = Field(..., examples=["ORDER_DIRECTION_BUY", "ORDER_DIRECTION_SELL"])
+    direction: str = Field(..., examples=["STOP_ORDER_DIRECTION_BUY", "STOP_ORDER_DIRECTION_SELL"])
     stop_order_type: str = Field(
         ...,
-        examples=["STOP_ORDER_TYPE_STOP_LOSS", "STOP_ORDER_TYPE_TAKE_PROFIT"],
+        examples=["STOP_ORDER_TYPE_STOP_LOSS", "STOP_ORDER_TYPE_STOP_LIMIT", "STOP_ORDER_TYPE_TAKE_PROFIT"],
     )
     stop_price: str = Field(..., min_length=1)
     price: str | None = Field(default=None, description="Лимитная цена исполнения (для StopLimit/TakeProfit)")
     expiration_type: str = Field(default="STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL")
+    confirm_margin_trade: bool | None = Field(default=None)
 
     @model_validator(mode="after")
     def validate_prices(self) -> "TBankStopOrderCreateRequest":
-        if self.stop_order_type == "STOP_ORDER_TYPE_STOP_LOSS" and self.price is None:
-            return self
+        if self.stop_order_type == "STOP_ORDER_TYPE_STOP_LIMIT" and self.price is None:
+            raise ValueError("price is required for STOP_ORDER_TYPE_STOP_LIMIT")
         return self
 
 

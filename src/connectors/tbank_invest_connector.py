@@ -451,6 +451,10 @@ class TBankInvestConnector:
         expiration_type: str = "STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL",
         price: Decimal | None = None,
         expire_date: datetime | None = None,
+        exchange_order_type: str | None = None,
+        order_id: str | None = None,
+        price_type: str | None = "PRICE_TYPE_CURRENCY",
+        confirm_margin_trade: bool | None = None,
     ) -> dict[str, Any]:
         if quantity_lots <= 0:
             raise TBankInvestRequestError("quantity_lots must be greater than 0")
@@ -468,7 +472,14 @@ class TBankInvestConnector:
             "expirationType": expiration_type,
             "stopOrderType": stop_order_type,
             "instrumentId": instrument_id.strip(),
+            "orderId": order_id or str(uuid.uuid4()),
         }
+        if exchange_order_type:
+            payload["exchangeOrderType"] = exchange_order_type
+        if price_type:
+            payload["priceType"] = price_type
+        if confirm_margin_trade is not None:
+            payload["confirmMarginTrade"] = bool(confirm_margin_trade)
         if expire_date is not None:
             payload["expireDate"] = self._to_utc_rfc3339(expire_date)
         if payload["price"] is None:

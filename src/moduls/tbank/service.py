@@ -729,22 +729,32 @@ class TBankTradingService:
         stop_price: str,
         price: str | None = None,
         expiration_type: str = "STOP_ORDER_EXPIRATION_TYPE_GOOD_TILL_CANCEL",
+        confirm_margin_trade: bool | None = None,
     ) -> dict:
         if not self.account_id:
             raise TBankInvestRequestError("User account_id is not configured")
 
         stop_price_value = Decimal(stop_price.strip())
         limit_price_value = Decimal(price.strip()) if price and price.strip() else None
+        if stop_order_type == "STOP_ORDER_TYPE_STOP_LOSS" and limit_price_value is not None:
+            raise TBankInvestRequestError("price is not supported for STOP_ORDER_TYPE_STOP_LOSS; use STOP_ORDER_TYPE_STOP_LIMIT")
+        normalized_direction = self._to_stop_order_direction(direction)
+        exchange_order_type = self._resolve_stop_exchange_order_type(
+            stop_order_type=stop_order_type,
+            price=limit_price_value,
+        )
 
         return await self.connector.post_stop_order(
             account_id=self.account_id,
             instrument_id=figi,
             quantity_lots=quantity_lots,
-            direction=direction,
+            direction=normalized_direction,
             stop_order_type=stop_order_type,
             stop_price=stop_price_value,
             price=limit_price_value,
             expiration_type=expiration_type,
+            exchange_order_type=exchange_order_type,
+            confirm_margin_trade=confirm_margin_trade,
         )
 
     async def cancel_stop_order(self, stop_order_id: str) -> dict:
@@ -766,6 +776,39 @@ class TBankTradingService:
         if not self.account_id:
             raise TBankInvestRequestError("User account_id is not configured")
         return await self.connector.get_operations(account_id=self.account_id, days=days)
+
+    @staticmethod
+    def _to_stop_order_direction(direction: str) -> str:
+        mapping = {
+            "ORDER_DIRECTION_BUY": "STOP_ORDER_DIRECTION_BUY",
+            "ORDER_DIRECTION_SELL": "STOP_ORDER_DIRECTION_SELL",
+            "STOP_ORDER_DIRECTION_BUY": "STOP_ORDER_DIRECTION_BUY",
+            "STOP_ORDER_DIRECTION_SELL": "STOP_ORDER_DIRECTION_SELL",
+        }
+        normalized = mapping.get(direction.strip())
+        if normalized is None:
+            raise TBankInvestRequestError("Unsupported stop order direction")
+        return normalized
+
+    @staticmethod
+    def _resolve_stop_exchange_order_type(
+        *,
+        stop_order_type: str,
+        price: Decimal | None,
+    ) -> str:
+        if stop_order_type not in {
+            "STOP_ORDER_TYPE_STOP_LOSS",
+            "STOP_ORDER_TYPE_STOP_LIMIT",
+            "STOP_ORDER_TYPE_TAKE_PROFIT",
+        }:
+            raise TBankInvestRequestError("Unsupported stop order type")
+        if stop_order_type == "STOP_ORDER_TYPE_STOP_LIMIT":
+            if price is None:
+                raise TBankInvestRequestError("price is required for STOP_ORDER_TYPE_STOP_LIMIT")
+            return "EXCHANGE_ORDER_TYPE_LIMIT"
+        if stop_order_type == "STOP_ORDER_TYPE_TAKE_PROFIT":
+            return "EXCHANGE_ORDER_TYPE_LIMIT" if price is not None else "EXCHANGE_ORDER_TYPE_MARKET"
+        return "EXCHANGE_ORDER_TYPE_MARKET"
 
 
 class TBankMonitorService:
@@ -883,10 +926,7 @@ class TBankMonitorService:
             hit = abs(change_percent) >= abs(row.threshold_percent) or abs(change_rub) >= abs(row.threshold_rub)
 
             if hit:
-                can_notify = True
-                if row.last_notified_at_msk is not None:
-                    can_notify = (now_msk - row.last_notified_at_msk).total_seconds() >= row.interval_seconds
-                if can_notify:
+                if not row.alert_active:
                     await self.db.tbank_price_monitor.touch_notified(row.id, now_msk)
                     events.append(
                         TBankMonitorTriggeredEvent(
@@ -906,7 +946,10 @@ class TBankMonitorService:
                 else:
                     await self.db.tbank_price_monitor.touch_checked(row.id, now_msk)
             else:
-                await self.db.tbank_price_monitor.touch_checked(row.id, now_msk)
+                if row.alert_active:
+                    await self.db.tbank_price_monitor.clear_alert(row.id, now_msk)
+                else:
+                    await self.db.tbank_price_monitor.touch_checked(row.id, now_msk)
 
         return TBankMonitorCheckResponse(checked=checked, triggered=len(events), events=events)
 

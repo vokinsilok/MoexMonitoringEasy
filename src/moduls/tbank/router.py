@@ -613,6 +613,7 @@ async def create_stop_order(payload: TBankStopOrderCreateRequest, db: DBDep) -> 
             stop_price=payload.stop_price,
             price=payload.price,
             expiration_type=payload.expiration_type,
+            confirm_margin_trade=payload.confirm_margin_trade,
         )
         return TBankTradingActionResponse(ok=True, details=result)
     except TBankInvestRequestError as exc:

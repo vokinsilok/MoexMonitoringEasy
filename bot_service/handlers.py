@@ -718,7 +718,7 @@ def _stop_type_map(label: str) -> str | None:
     normalized = (label or "").strip().casefold()
     mapping = {
         STOP_KIND_STOP_LOSS_LABEL.casefold(): "STOP_ORDER_TYPE_STOP_LOSS",
-        STOP_KIND_STOP_LOSS_LIMIT_LABEL.casefold(): "STOP_ORDER_TYPE_STOP_LOSS",
+        STOP_KIND_STOP_LOSS_LIMIT_LABEL.casefold(): "STOP_ORDER_TYPE_STOP_LIMIT",
         STOP_KIND_TAKE_PROFIT_LABEL.casefold(): "STOP_ORDER_TYPE_TAKE_PROFIT",
     }
     return mapping.get(normalized)

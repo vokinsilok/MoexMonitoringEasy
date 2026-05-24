@@ -132,6 +132,7 @@ class TBankPriceMonitor(Base):
     threshold_rub: Mapped[Decimal] = mapped_column(Numeric(20, 9), nullable=False)
     base_price: Mapped[Decimal] = mapped_column(Numeric(20, 9), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    alert_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     last_checked_at_msk: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     last_notified_at_msk: Mapped[datetime | None] = mapped_column(DateTime(timezone=False), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -124,6 +124,7 @@ class TelegramSharesBrowserService:
         stop_order_type: str,
         stop_price: str,
         price: str | None = None,
+        confirm_margin_trade: bool | None = None,
     ) -> dict:
         return await self._post_payload(
             "/api/v1/tbank/stop-orders",
@@ -135,6 +136,7 @@ class TelegramSharesBrowserService:
                 "stop_order_type": stop_order_type,
                 "stop_price": stop_price,
                 "price": price,
+                "confirm_margin_trade": confirm_margin_trade,
             },
         )
 

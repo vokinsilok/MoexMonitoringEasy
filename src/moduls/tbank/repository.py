@@ -377,6 +377,7 @@ class TBankPriceMonitorRepository(BaseRepository):
             threshold_rub=threshold_rub,
             base_price=base_price,
             is_active=True,
+            alert_active=False,
         )
         self.session.add(row)
         await self.session.flush()
@@ -406,7 +407,12 @@ class TBankPriceMonitorRepository(BaseRepository):
             update(self.model)
             .where(self.model.id == monitor_id)
             .where(self.model.telegram_user_id == telegram_user_id)
-            .values(is_active=is_active, updated_at=datetime.now(timezone.utc))
+            .values(
+                is_active=is_active,
+                alert_active=False,
+                last_notified_at_msk=None,
+                updated_at=datetime.now(timezone.utc),
+            )
         )
         result = await self.session.execute(stmt)
         return bool(result.rowcount)
@@ -435,6 +441,19 @@ class TBankPriceMonitorRepository(BaseRepository):
             .values(
                 last_checked_at_msk=notified_at_msk,
                 last_notified_at_msk=notified_at_msk,
+                alert_active=True,
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await self.session.execute(stmt)
+
+    async def clear_alert(self, monitor_id: int, checked_at_msk: datetime) -> None:
+        stmt = (
+            update(self.model)
+            .where(self.model.id == monitor_id)
+            .values(
+                last_checked_at_msk=checked_at_msk,
+                alert_active=False,
                 updated_at=datetime.now(timezone.utc),
             )
         )
@@ -445,7 +464,12 @@ class TBankPriceMonitorRepository(BaseRepository):
             update(self.model)
             .where(self.model.id == monitor_id)
             .where(self.model.telegram_user_id == telegram_user_id)
-            .values(base_price=base_price, updated_at=datetime.now(timezone.utc))
+            .values(
+                base_price=base_price,
+                alert_active=False,
+                last_notified_at_msk=None,
+                updated_at=datetime.now(timezone.utc),
+            )
         )
         result = await self.session.execute(stmt)
         return bool(result.rowcount)
@@ -464,6 +488,8 @@ class TBankPriceMonitorRepository(BaseRepository):
             .values(
                 threshold_percent=threshold_percent,
                 threshold_rub=threshold_rub,
+                alert_active=False,
+                last_notified_at_msk=None,
                 updated_at=datetime.now(timezone.utc),
             )
         )
