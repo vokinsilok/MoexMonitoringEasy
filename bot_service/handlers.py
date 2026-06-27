@@ -2020,7 +2020,7 @@ async def portfolio_analysis_start(message: Message) -> None:
 async def portfolio_analysis_callback(callback: CallbackQuery) -> None:
     if not callback.from_user or not callback.message:
         return
-    horizon = str(callback.data or "").split(":", maxsplit=1)[-1]
+    horizon = str(callback.data or "").rsplit(":", maxsplit=1)[-1]
     await _safe_telegram_call(callback.answer("Готовлю анализ..."))
     await _safe_telegram_call(
         callback.message.answer(
