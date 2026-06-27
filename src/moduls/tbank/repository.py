@@ -16,8 +16,12 @@ from src.moduls.tbank.models import (
 class TBankShareRepository(BaseRepository):
     model = TBankShare
 
-    async def mark_all_inactive(self) -> None:
-        await self.session.execute(update(self.model).values(is_active=False))
+    async def mark_all_inactive(self, instrument_types: list[str] | None = None) -> None:
+        stmt = update(self.model).values(is_active=False)
+        normalized_types = self._normalize_instrument_types(instrument_types)
+        if normalized_types:
+            stmt = stmt.where(self.model.instrument_type.in_(normalized_types))
+        await self.session.execute(stmt)
 
     async def upsert_many(self, rows: list[dict]) -> int:
         if not rows:
@@ -28,6 +32,7 @@ class TBankShareRepository(BaseRepository):
         insert_stmt = pg_insert(self.model).values(prepared_rows)
 
         update_columns = {
+            "instrument_type": insert_stmt.excluded.instrument_type,
             "ticker": insert_stmt.excluded.ticker,
             "class_code": insert_stmt.excluded.class_code,
             "isin": insert_stmt.excluded.isin,
@@ -52,19 +57,32 @@ class TBankShareRepository(BaseRepository):
         await self.session.execute(upsert_stmt)
         return len(rows)
 
-    async def list_active(self, limit: int = 100, offset: int = 0) -> list[TBankShare]:
+    async def list_active(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        instrument_types: list[str] | None = None,
+    ) -> list[TBankShare]:
         stmt = (
             select(self.model)
             .where(self.model.is_active.is_(True))
-            .order_by(self.model.ticker.asc().nulls_last(), self.model.figi.asc())
-            .offset(offset)
-            .limit(limit)
         )
+        normalized_types = self._normalize_instrument_types(instrument_types)
+        if normalized_types:
+            stmt = stmt.where(self.model.instrument_type.in_(normalized_types))
+        stmt = stmt.order_by(
+            self.model.instrument_type.asc(),
+            self.model.ticker.asc().nulls_last(),
+            self.model.figi.asc(),
+        ).offset(offset).limit(limit)
         result = await self.session.execute(stmt)
         return result.scalars().all()
 
-    async def count_active(self) -> int:
+    async def count_active(self, instrument_types: list[str] | None = None) -> int:
         stmt = select(func.count(self.model.id)).where(self.model.is_active.is_(True))
+        normalized_types = self._normalize_instrument_types(instrument_types)
+        if normalized_types:
+            stmt = stmt.where(self.model.instrument_type.in_(normalized_types))
         result = await self.session.execute(stmt)
         return int(result.scalar_one())
 
@@ -95,6 +113,16 @@ class TBankShareRepository(BaseRepository):
         )
         result = await self.session.execute(stmt)
         return result.scalars().first()
+
+    @staticmethod
+    def _normalize_instrument_types(instrument_types: list[str] | None) -> list[str]:
+        allowed = {"share", "bond", "etf"}
+        normalized = []
+        for raw_value in instrument_types or []:
+            value = str(raw_value).strip().lower()
+            if value in allowed and value not in normalized:
+                normalized.append(value)
+        return normalized
 
 
 class TBankUserCredentialRepository(BaseRepository):

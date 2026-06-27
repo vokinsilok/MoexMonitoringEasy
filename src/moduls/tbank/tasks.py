@@ -43,6 +43,7 @@ async def sync_russian_shares_task(
         instrument_status: str = "INSTRUMENT_STATUS_BASE",
         instrument_exchange: str = "INSTRUMENT_EXCHANGE_UNSPECIFIED",
         include_dealer: bool = True,
+        instrument_types: list[str] | None = None,
 ) -> dict:
     connector = _build_connector()
     cache = await _connect_cache()
@@ -50,7 +51,8 @@ async def sync_russian_shares_task(
         async with DBManager(session_factory=async_session_maker) as db:
             async with db.transaction():
                 service = TBankSharesService(connector=connector, db=db, cache=cache)
-                result = await service.sync_shares_to_db(
+                result = await service.sync_instruments_to_db(
+                    instrument_types=instrument_types or ["share", "bond", "etf"],
                     instrument_status=instrument_status,
                     instrument_exchange=instrument_exchange,
                     russian_only=True,

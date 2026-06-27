@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     TBANK_MONITOR_EVENTS_QUEUE_KEY: str = "tbank:monitor:events"
     TBANK_CLOSED_STATUS_REFRESH_SECONDS: int = 1800
 
+    AI_API_KEY: str = ""
+    AI_BASE_URL: str = "https://api.proxyapi.ru/openrouter/v1"
+    AI_MODEL: str = "deepseek/deepseek-v3.2"
+    AI_TIMEOUT_SECONDS: int = 90
+    AI_MAX_TOKENS: int = 4000
+    AI_TEMPERATURE: float = 0.2
+
     @field_validator("TBANK_SYNC_INTERVAL_SECONDS", mode="before")
     @classmethod
     def validate_tbank_sync_interval(cls, value):

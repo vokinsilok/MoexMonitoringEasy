@@ -17,6 +17,7 @@ class TBankSharesResponse(BaseModel):
 class TBankStoredShareItem(BaseModel):
     id: int
     figi: str
+    instrument_type: str = "share"
     ticker: str | None = None
     class_code: str | None = None
     isin: str | None = None
@@ -65,6 +66,7 @@ class TBankSyncResponse(BaseModel):
     prices_saved: int = Field(..., description="Сколько цен акций было сохранено в историю")
     instrument_status: str = Field(..., description="Примененный фильтр instrumentStatus")
     instrument_exchange: str = Field(..., description="Примененный фильтр instrumentExchange")
+    instrument_types: list[str] = Field(default_factory=lambda: ["share"], description="Типы синхронизированных инструментов")
     trading_open: bool = Field(..., description="Открыты ли торги на MOEX в текущий момент")
     skipped: bool = Field(
         default=False,
@@ -280,6 +282,20 @@ class TBankMonitorGlobalCheckResponse(BaseModel):
 
 class TBankPortfolioRequest(BaseModel):
     telegram_user_id: int = Field(..., ge=1)
+
+
+class TBankPortfolioAnalysisRequest(BaseModel):
+    telegram_user_id: int = Field(..., ge=1)
+    horizon: str = Field(..., examples=["1d", "7d", "1m", "1y"])
+
+
+class TBankPortfolioAnalysisResponse(BaseModel):
+    horizon: str
+    horizon_label: str
+    generated_at_msk: str
+    model: str
+    report: str
+    portfolio: dict[str, Any]
 
 
 class TBankOperationsRequest(BaseModel):

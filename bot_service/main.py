@@ -5,6 +5,7 @@ import logging
 import redis.asyncio as redis
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -17,6 +18,16 @@ from bot_service.handlers import MON_CB_DEL_PREFIX, MON_CB_REBASE_PREFIX, router
 main_logger = logging.getLogger("moex_bot")
 if not main_logger.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+def _build_bot(token: str, *, use_proxy: bool) -> Bot:
+    proxy_url = settings.TELEGRAM_PROXY_URL.strip()
+    session = AiohttpSession(proxy=proxy_url) if use_proxy and proxy_url else None
+    return Bot(
+        token=token,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
 
 try:
     from bot_service.access_middleware import AccessGuardMiddleware
@@ -163,17 +174,24 @@ async def main() -> None:
     dispatcher.include_router(router)
 
     retry_delay_seconds = 5
+    use_proxy = False
     while True:
-        bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        bot = _build_bot(token=token, use_proxy=use_proxy)
         stop_event = asyncio.Event()
         monitor_task = asyncio.create_task(_run_monitor_consumer(bot=bot, stop_event=stop_event))
         try:
             await dispatcher.start_polling(bot)
             return
         except TelegramNetworkError as exc:
+            if settings.TELEGRAM_PROXY_URL.strip() and not use_proxy:
+                use_proxy = True
+                main_logger.info("Direct Telegram connection failed; retrying through configured proxy")
             main_logger.info(f"Telegram network error, retry in {retry_delay_seconds}s: {exc}")
             await asyncio.sleep(retry_delay_seconds)
         except OSError as exc:
+            if settings.TELEGRAM_PROXY_URL.strip() and not use_proxy:
+                use_proxy = True
+                main_logger.info("Direct Telegram connection failed; retrying through configured proxy")
             main_logger.info(f"Network OS error, retry in {retry_delay_seconds}s: {exc}")
             await asyncio.sleep(retry_delay_seconds)
         finally:

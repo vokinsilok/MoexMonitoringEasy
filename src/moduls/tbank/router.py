@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query
 
+from src.connectors.ai_gateway_connector import AIGatewayConnector, AIGatewayRequestError
 from src.connectors.tbank_invest_connector import TBankInvestConnector, TBankInvestRequestError
 from src.core.config import settings
 from src.init import redis_manager
@@ -24,6 +25,8 @@ from src.moduls.tbank.schemas import (
     TBankOrderCancelRequest,
     TBankOrderCreateRequest,
     TBankOperationsRequest,
+    TBankPortfolioAnalysisRequest,
+    TBankPortfolioAnalysisResponse,
     TBankPortfolioRequest,
     TBankSharesResponse,
     TBankStopOrderCancelRequest,
@@ -39,6 +42,7 @@ from src.moduls.tbank.schemas import (
 from src.moduls.tbank.service import (
     ALLOWED_SECTORS,
     TBankMonitorService,
+    TBankPortfolioAnalysisService,
     TBankSharesService,
     TBankTradingService,
 )
@@ -55,6 +59,17 @@ def _build_global_connector() -> TBankInvestConnector:
         timeout=settings.TBANK_INVEST_TIMEOUT_SECONDS,
         ssl_verify=settings.TBANK_INVEST_SSL_VERIFY,
         ca_bundle_path=settings.TBANK_INVEST_CA_BUNDLE_PATH,
+    )
+
+
+def _build_ai_connector() -> AIGatewayConnector:
+    return AIGatewayConnector(
+        api_key=settings.AI_API_KEY,
+        base_url=settings.AI_BASE_URL,
+        model=settings.AI_MODEL,
+        timeout=settings.AI_TIMEOUT_SECONDS,
+        max_tokens=settings.AI_MAX_TOKENS,
+        temperature=settings.AI_TEMPERATURE,
     )
 
 
@@ -153,6 +168,48 @@ async def get_tbank_shares(
         raise HTTPException(status_code=502, detail=message) from exc
 
 
+@tbank_router.get(
+    "/instruments",
+    response_model=TBankSharesResponse,
+    summary="Получить список инструментов из T-Bank Invest API",
+)
+async def get_tbank_instruments(
+    instrument_status: str = Query(default="INSTRUMENT_STATUS_BASE"),
+    instrument_exchange: str = Query(default="INSTRUMENT_EXCHANGE_UNSPECIFIED"),
+    request_timeout_seconds: int = Query(default=30, ge=3, le=90),
+    russian_only: bool = Query(default=True),
+    include_dealer: bool = Query(default=True),
+    instrument_types: list[str] = Query(default=["share", "bond", "etf"]),
+) -> TBankSharesResponse:
+    connector = _build_global_connector()
+    service = TBankSharesService(connector=connector, cache=redis_manager)
+    try:
+        return await asyncio.wait_for(
+            service.get_instruments(
+                instrument_types=instrument_types,
+                instrument_status=instrument_status,
+                instrument_exchange=instrument_exchange,
+                russian_only=russian_only,
+                include_dealer=include_dealer,
+            ),
+            timeout=request_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"T-Bank request exceeded {request_timeout_seconds}s timeout",
+        ) from exc
+    except TBankInvestRequestError as exc:
+        message = str(exc)
+        if "token is not configured" in message.lower():
+            raise HTTPException(status_code=503, detail=message) from exc
+        if "HTTP 401" in message:
+            raise HTTPException(status_code=401, detail=message) from exc
+        if "HTTP 403" in message:
+            raise HTTPException(status_code=403, detail=message) from exc
+        raise HTTPException(status_code=502, detail=message) from exc
+
+
 @tbank_router.post(
     "/shares/sync/task",
     response_model=TBankTaskEnqueueResponse,
@@ -167,6 +224,27 @@ async def enqueue_tbank_shares_sync_task(
         instrument_status=instrument_status,
         instrument_exchange=instrument_exchange,
         include_dealer=include_dealer,
+        instrument_types=["share"],
+    )
+    return TBankTaskEnqueueResponse(task_id=task.task_id, queue_name=settings.TASKIQ_QUEUE_NAME)
+
+
+@tbank_router.post(
+    "/instruments/sync/task",
+    response_model=TBankTaskEnqueueResponse,
+    summary="Поставить в очередь синхронизацию российских инструментов",
+)
+async def enqueue_tbank_instruments_sync_task(
+    instrument_status: str = Query(default="INSTRUMENT_STATUS_BASE"),
+    instrument_exchange: str = Query(default="INSTRUMENT_EXCHANGE_UNSPECIFIED"),
+    include_dealer: bool = Query(default=True),
+    instrument_types: list[str] = Query(default=["share", "bond", "etf"]),
+) -> TBankTaskEnqueueResponse:
+    task = await sync_russian_shares_task.kiq(
+        instrument_status=instrument_status,
+        instrument_exchange=instrument_exchange,
+        include_dealer=include_dealer,
+        instrument_types=instrument_types,
     )
     return TBankTaskEnqueueResponse(task_id=task.task_id, queue_name=settings.TASKIQ_QUEUE_NAME)
 
@@ -212,6 +290,49 @@ async def sync_tbank_shares(
         raise HTTPException(status_code=502, detail=message) from exc
 
 
+@tbank_router.post(
+    "/instruments/sync",
+    response_model=TBankSyncResponse,
+    summary="Синхронизировать акции, облигации и фонды из T-Bank Invest API в базу данных",
+)
+async def sync_tbank_instruments(
+    db: AtomicDBDep,
+    instrument_status: str = Query(default="INSTRUMENT_STATUS_BASE"),
+    instrument_exchange: str = Query(default="INSTRUMENT_EXCHANGE_UNSPECIFIED"),
+    request_timeout_seconds: int = Query(default=60, ge=3, le=180),
+    russian_only: bool = Query(default=True),
+    include_dealer: bool = Query(default=True),
+    instrument_types: list[str] = Query(default=["share", "bond", "etf"]),
+) -> TBankSyncResponse:
+    connector = _build_global_connector()
+    service = TBankSharesService(connector=connector, db=db, cache=redis_manager)
+    try:
+        return await asyncio.wait_for(
+            service.sync_instruments_to_db(
+                instrument_types=instrument_types,
+                instrument_status=instrument_status,
+                instrument_exchange=instrument_exchange,
+                russian_only=russian_only,
+                include_dealer=include_dealer,
+            ),
+            timeout=request_timeout_seconds,
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"T-Bank sync exceeded {request_timeout_seconds}s timeout",
+        ) from exc
+    except TBankInvestRequestError as exc:
+        message = str(exc)
+        if "token is not configured" in message.lower():
+            raise HTTPException(status_code=503, detail=message) from exc
+        if "HTTP 401" in message:
+            raise HTTPException(status_code=401, detail=message) from exc
+        if "HTTP 403" in message:
+            raise HTTPException(status_code=403, detail=message) from exc
+        raise HTTPException(status_code=502, detail=message) from exc
+
+
 @tbank_router.get(
     "/shares/stored",
     response_model=TBankStoredSharesResponse,
@@ -225,6 +346,26 @@ async def get_stored_tbank_shares(
     connector = _build_global_connector()
     service = TBankSharesService(connector=connector, db=db, cache=redis_manager)
     return await service.get_stored_shares(limit=limit, offset=offset)
+
+
+@tbank_router.get(
+    "/instruments/stored",
+    response_model=TBankStoredSharesResponse,
+    summary="Получить сохраненные инструменты T-Bank из базы данных",
+)
+async def get_stored_tbank_instruments(
+    db: DBDep,
+    limit: int = Query(default=100, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    instrument_types: list[str] = Query(default=["share", "bond", "etf"]),
+) -> TBankStoredSharesResponse:
+    connector = _build_global_connector()
+    service = TBankSharesService(connector=connector, db=db, cache=redis_manager)
+    return await service.get_stored_instruments(
+        limit=limit,
+        offset=offset,
+        instrument_types=instrument_types,
+    )
 
 
 @tbank_router.get(
@@ -252,6 +393,35 @@ async def get_online_share_details(
 
     if item is None:
         raise HTTPException(status_code=404, detail="Share not found")
+    return item
+
+
+@tbank_router.get(
+    "/instruments/{figi}/online",
+    response_model=TBankStoredShareItem,
+    summary="Получить live-детали инструмента по FIGI из T-Bank Invest API",
+)
+async def get_online_instrument_details(
+    figi: str,
+    db: DBDep,
+    instrument_type: str | None = Query(default=None),
+) -> TBankStoredShareItem:
+    connector = _build_global_connector()
+    service = TBankSharesService(connector=connector, db=db, cache=redis_manager)
+    try:
+        item = await service.get_instrument_details_online(figi=figi, instrument_type=instrument_type)
+    except TBankInvestRequestError as exc:
+        message = str(exc)
+        if "token is not configured" in message.lower():
+            raise HTTPException(status_code=503, detail=message) from exc
+        if "HTTP 401" in message:
+            raise HTTPException(status_code=401, detail=message) from exc
+        if "HTTP 403" in message:
+            raise HTTPException(status_code=403, detail=message) from exc
+        raise HTTPException(status_code=502, detail=message) from exc
+
+    if item is None:
+        raise HTTPException(status_code=404, detail="Instrument not found")
     return item
 
 
@@ -661,6 +831,32 @@ async def get_portfolio(payload: TBankPortfolioRequest, db: DBDep) -> TBankTradi
     try:
         result = await service.get_portfolio()
         return TBankTradingActionResponse(ok=True, details=result)
+    except TBankInvestRequestError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@tbank_router.post(
+    "/portfolio/analyze",
+    response_model=TBankPortfolioAnalysisResponse,
+    summary="Сформировать AI-анализ портфеля пользователя",
+)
+async def analyze_portfolio(
+    payload: TBankPortfolioAnalysisRequest,
+    db: DBDep,
+) -> TBankPortfolioAnalysisResponse:
+    trading_service = await _build_user_trading_service(db=db, telegram_user_id=payload.telegram_user_id)
+    analysis_service = TBankPortfolioAnalysisService(
+        trading_service=trading_service,
+        ai_connector=_build_ai_connector(),
+        model=settings.AI_MODEL,
+    )
+    try:
+        return await analysis_service.analyze(horizon=payload.horizon)
+    except AIGatewayRequestError as exc:
+        message = str(exc)
+        if "api key is not configured" in message.lower():
+            raise HTTPException(status_code=503, detail=message) from exc
+        raise HTTPException(status_code=502, detail=message) from exc
     except TBankInvestRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 

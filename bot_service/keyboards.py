@@ -11,6 +11,10 @@ CB_REFRESH_DETAILS = "shrd"
 CB_SEARCH = "shs"
 CB_MODE_ALL = "sha"
 CB_MODE_FAVORITES = "shf"
+CB_TYPE_ALL = "sht:all"
+CB_TYPE_SHARE = "sht:share"
+CB_TYPE_BOND = "sht:bond"
+CB_TYPE_ETF = "sht:etf"
 CB_FAVORITE_TOGGLE_PREFIX = "shv"
 
 
@@ -20,6 +24,7 @@ def shares_list_keyboard(
     total_pages: int,
     mode: str = "all",
     has_query: bool = False,
+    instrument_filter: str = "all",
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [
@@ -28,6 +33,14 @@ def shares_list_keyboard(
             InlineKeyboardButton(text="\u0412\u0441\u0435", callback_data=CB_MODE_ALL),
         ]
     ]
+    rows.append(
+        [
+            InlineKeyboardButton(text=_type_button_text("all", instrument_filter, "Все"), callback_data=CB_TYPE_ALL),
+            InlineKeyboardButton(text=_type_button_text("share", instrument_filter, "Акции"), callback_data=CB_TYPE_SHARE),
+            InlineKeyboardButton(text=_type_button_text("bond", instrument_filter, "Облигации"), callback_data=CB_TYPE_BOND),
+            InlineKeyboardButton(text=_type_button_text("etf", instrument_filter, "Фонды"), callback_data=CB_TYPE_ETF),
+        ]
+    )
 
     for item in items:
         title = f"{item.ticker} - {item.name}"
@@ -76,3 +89,7 @@ def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
     return f"{text[: max_len - 1]}…"
+
+
+def _type_button_text(value: str, current: str, label: str) -> str:
+    return f"• {label}" if value == current else label

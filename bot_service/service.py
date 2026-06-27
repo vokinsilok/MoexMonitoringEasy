@@ -15,12 +15,14 @@ class TelegramSharesBrowserService:
         self,
         page: int,
         page_size: int,
+        instrument_types: list[str] | None = None,
     ) -> tuple[list[ShareViewItem], int, int, int]:
         safe_page_size = min(max(page_size, 1), 1000)
         safe_page = max(page, 1)
         payload = await self._fetch_stored_shares_payload(
             limit=safe_page_size,
             offset=(safe_page - 1) * safe_page_size,
+            instrument_types=instrument_types,
         )
         total = self._safe_int(payload.get("total")) or 0
         total_pages = max(1, (total + safe_page_size - 1) // safe_page_size)
@@ -29,6 +31,7 @@ class TelegramSharesBrowserService:
             payload = await self._fetch_stored_shares_payload(
                 limit=safe_page_size,
                 offset=(safe_page - 1) * safe_page_size,
+                instrument_types=instrument_types,
             )
             total = self._safe_int(payload.get("total")) or total
 
@@ -50,18 +53,25 @@ class TelegramSharesBrowserService:
         figi_value = figi.strip()
         if not figi_value:
             raise RuntimeError("Пустой FIGI")
-        payload = await self._get_payload(f"/api/v1/tbank/shares/{quote(figi_value, safe='')}/online")
+        payload = await self._get_payload(f"/api/v1/tbank/instruments/{quote(figi_value, safe='')}/online")
         parsed = self._to_share_view_item(payload)
         if parsed is None:
-            raise RuntimeError("Некорректный ответ backend API для live-деталей акции")
+            raise RuntimeError("Некорректный ответ backend API для live-деталей инструмента")
         return parsed
 
-    async def _fetch_stored_shares_payload(self, limit: int, offset: int) -> dict:
-        params = {
-            "limit": str(limit),
-            "offset": str(offset),
-        }
-        url = f"{self._base_url}/api/v1/tbank/shares/stored"
+    async def _fetch_stored_shares_payload(
+        self,
+        limit: int,
+        offset: int,
+        instrument_types: list[str] | None = None,
+    ) -> dict:
+        params: list[tuple[str, str]] = [
+            ("limit", str(limit)),
+            ("offset", str(offset)),
+        ]
+        url = f"{self._base_url}/api/v1/tbank/instruments/stored"
+        for instrument_type in instrument_types or ["share", "bond", "etf"]:
+            params.append(("instrument_types", instrument_type))
         try:
             async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
                 response = await client.get(url, params=params)
@@ -321,6 +331,12 @@ class TelegramSharesBrowserService:
             {"telegram_user_id": telegram_user_id},
         )
 
+    async def analyze_portfolio(self, telegram_user_id: int, horizon: str) -> dict:
+        return await self._post_payload(
+            "/api/v1/tbank/portfolio/analyze",
+            {"telegram_user_id": telegram_user_id, "horizon": horizon},
+        )
+
     async def get_operations(self, telegram_user_id: int, days: int = 30) -> dict:
         return await self._post_payload(
             "/api/v1/tbank/operations",
@@ -346,7 +362,11 @@ class TelegramSharesBrowserService:
             {"telegram_user_id": telegram_user_id, "figi": figi},
         )
 
-    async def get_all_stored_shares(self, limit: int = 3000) -> list[ShareViewItem]:
+    async def get_all_stored_shares(
+        self,
+        limit: int = 5000,
+        instrument_types: list[str] | None = None,
+    ) -> list[ShareViewItem]:
         safe_limit = max(limit, 1)
         page_size = min(safe_limit, 1000)
         all_items: list[ShareViewItem] = []
@@ -354,7 +374,11 @@ class TelegramSharesBrowserService:
         total_pages = 1
 
         while len(all_items) < safe_limit and page <= total_pages:
-            items, _, _, total_pages = await self.get_shares_page(page=page, page_size=page_size)
+            items, _, _, total_pages = await self.get_shares_page(
+                page=page,
+                page_size=page_size,
+                instrument_types=instrument_types,
+            )
             if not items:
                 break
             all_items.extend(items)
@@ -497,6 +521,7 @@ class TelegramSharesBrowserService:
         return ShareViewItem(
             id=self._safe_int(item.get("id")) or 0,
             figi=figi,
+            instrument_type=str(item.get("instrument_type", "")).strip().lower() or "share",
             ticker=ticker,
             name=name,
             currency=currency,

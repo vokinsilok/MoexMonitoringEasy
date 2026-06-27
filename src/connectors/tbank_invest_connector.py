@@ -17,6 +17,9 @@ class TBankSharesResult:
     raw_payload: dict[str, Any]
 
 
+TBankInstrumentsResult = TBankSharesResult
+
+
 @dataclass(slots=True)
 class TBankExchangeTradingStatus:
     exchange: str
@@ -71,11 +74,54 @@ class TBankInvestConnector:
         instrument_status: str = "INSTRUMENT_STATUS_BASE",
         instrument_exchange: str = "INSTRUMENT_EXCHANGE_UNSPECIFIED",
     ) -> TBankSharesResult:
+        return await self.get_instruments(
+            instrument_type="share",
+            instrument_status=instrument_status,
+            instrument_exchange=instrument_exchange,
+        )
+
+    async def get_bonds(
+        self,
+        instrument_status: str = "INSTRUMENT_STATUS_BASE",
+        instrument_exchange: str = "INSTRUMENT_EXCHANGE_UNSPECIFIED",
+    ) -> TBankInstrumentsResult:
+        return await self.get_instruments(
+            instrument_type="bond",
+            instrument_status=instrument_status,
+            instrument_exchange=instrument_exchange,
+        )
+
+    async def get_etfs(
+        self,
+        instrument_status: str = "INSTRUMENT_STATUS_BASE",
+        instrument_exchange: str = "INSTRUMENT_EXCHANGE_UNSPECIFIED",
+    ) -> TBankInstrumentsResult:
+        return await self.get_instruments(
+            instrument_type="etf",
+            instrument_status=instrument_status,
+            instrument_exchange=instrument_exchange,
+        )
+
+    async def get_instruments(
+        self,
+        instrument_type: str,
+        instrument_status: str = "INSTRUMENT_STATUS_BASE",
+        instrument_exchange: str = "INSTRUMENT_EXCHANGE_UNSPECIFIED",
+    ) -> TBankInstrumentsResult:
         if not self.token:
             raise TBankInvestRequestError("T-Bank token is not configured")
 
+        endpoint_by_type = {
+            "share": "Shares",
+            "bond": "Bonds",
+            "etf": "Etfs",
+        }
+        endpoint_name = endpoint_by_type.get(instrument_type.strip().lower())
+        if endpoint_name is None:
+            raise TBankInvestRequestError(f"Unsupported instrument_type '{instrument_type}'")
+
         payload = await self._request_json(
-            "/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/Shares",
+            f"/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/{endpoint_name}",
             {
                 "instrumentStatus": instrument_status,
                 "instrumentExchange": instrument_exchange,
@@ -86,7 +132,7 @@ class TBankInvestConnector:
             raise TBankInvestRequestError(
                 "Unexpected T-Bank response shape: 'instruments' is missing"
             )
-        return TBankSharesResult(instruments=instruments, raw_payload=payload)
+        return TBankInstrumentsResult(instruments=instruments, raw_payload=payload)
 
     async def get_last_prices(self, figies: list[str]) -> dict[str, Decimal]:
         points = await self.get_last_price_points(figies)
@@ -130,53 +176,85 @@ class TBankInvestConnector:
         return prices
 
     async def get_share_by_figi(self, figi: str) -> dict[str, Any]:
+        return await self.get_instrument_by_figi(figi=figi, instrument_type="share")
+
+    async def get_bond_by_figi(self, figi: str) -> dict[str, Any]:
+        return await self.get_instrument_by_figi(figi=figi, instrument_type="bond")
+
+    async def get_etf_by_figi(self, figi: str) -> dict[str, Any]:
+        return await self.get_instrument_by_figi(figi=figi, instrument_type="etf")
+
+    async def get_instrument_by_figi(
+        self,
+        figi: str,
+        instrument_type: str | None = None,
+    ) -> dict[str, Any]:
         figi_value = figi.strip()
         if not figi_value:
             raise TBankInvestRequestError("figi is required")
 
+        types_to_try = [instrument_type.strip().lower()] if instrument_type else ["share", "bond", "etf"]
+        types_to_try = [item for item in types_to_try if item]
+        endpoint_by_type = {
+            "share": "ShareBy",
+            "bond": "BondBy",
+            "etf": "EtfBy",
+        }
         errors: list[TBankInvestRequestError] = []
 
-        try:
-            payload = await self._request_json(
-                "/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/ShareBy",
-                {
-                    "idType": "INSTRUMENT_ID_TYPE_FIGI",
-                    "id": figi_value,
-                },
-            )
-            instrument = payload.get("instrument")
-            if isinstance(instrument, dict):
-                return instrument
-        except TBankInvestRequestError as exc:
-            errors.append(exc)
-            exc_text = str(exc).lower()
-            if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
-                raise
+        for current_type in types_to_try:
+            endpoint_name = endpoint_by_type.get(current_type)
+            if endpoint_name is None:
+                continue
+            try:
+                payload = await self._request_json(
+                    f"/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/{endpoint_name}",
+                    {
+                        "idType": "INSTRUMENT_ID_TYPE_FIGI",
+                        "id": figi_value,
+                    },
+                )
+                instrument = payload.get("instrument")
+                if isinstance(instrument, dict):
+                    instrument.setdefault("instrumentType", current_type)
+                    return instrument
+            except TBankInvestRequestError as exc:
+                errors.append(exc)
+                exc_text = str(exc).lower()
+                if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
+                    raise
 
-        # Fallback for API environments where ShareBy may be unavailable.
+        # Fallback for API environments where *By methods may be unavailable.
         instruments = []
-        try:
-            base = await self.get_shares(
-                instrument_status="INSTRUMENT_STATUS_ALL",
-                instrument_exchange="INSTRUMENT_EXCHANGE_UNSPECIFIED",
-            )
-            instruments.extend(base.instruments)
-        except TBankInvestRequestError as exc:
-            errors.append(exc)
-            exc_text = str(exc).lower()
-            if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
-                raise
-        try:
-            dealer = await self.get_shares(
-                instrument_status="INSTRUMENT_STATUS_ALL",
-                instrument_exchange="INSTRUMENT_EXCHANGE_DEALER",
-            )
-            instruments.extend(dealer.instruments)
-        except TBankInvestRequestError as exc:
-            errors.append(exc)
-            exc_text = str(exc).lower()
-            if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
-                raise
+        for current_type in types_to_try:
+            try:
+                base = await self.get_instruments(
+                    instrument_type=current_type,
+                    instrument_status="INSTRUMENT_STATUS_ALL",
+                    instrument_exchange="INSTRUMENT_EXCHANGE_UNSPECIFIED",
+                )
+                for item in base.instruments:
+                    item.setdefault("instrumentType", current_type)
+                instruments.extend(base.instruments)
+            except TBankInvestRequestError as exc:
+                errors.append(exc)
+                exc_text = str(exc).lower()
+                if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
+                    raise
+            try:
+                dealer = await self.get_instruments(
+                    instrument_type=current_type,
+                    instrument_status="INSTRUMENT_STATUS_ALL",
+                    instrument_exchange="INSTRUMENT_EXCHANGE_DEALER",
+                )
+                for item in dealer.instruments:
+                    item.setdefault("instrumentType", current_type)
+                instruments.extend(dealer.instruments)
+            except TBankInvestRequestError as exc:
+                errors.append(exc)
+                exc_text = str(exc).lower()
+                if "token is not configured" in exc_text or "http 401" in exc_text or "http 403" in exc_text:
+                    raise
 
         for instrument in instruments:
             if not isinstance(instrument, dict):

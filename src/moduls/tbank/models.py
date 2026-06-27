@@ -12,6 +12,13 @@ class TBankShare(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     figi: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    instrument_type: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="share",
+        server_default="share",
+        index=True,
+    )
     ticker: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
     class_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
     isin: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)

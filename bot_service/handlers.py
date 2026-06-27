@@ -30,6 +30,10 @@ from bot_service.keyboards import (
     CB_REFRESH,
     CB_REFRESH_DETAILS,
     CB_SEARCH,
+    CB_TYPE_ALL,
+    CB_TYPE_BOND,
+    CB_TYPE_ETF,
+    CB_TYPE_SHARE,
     PAGE_SIZE,
     share_details_keyboard,
     shares_list_keyboard,
@@ -44,10 +48,11 @@ router = Router()
 service = TelegramSharesBrowserService()
 
 # User-facing labels (kept explicit to avoid mojibake regressions).
-MENU_SHARES = "📈 Список акций"
+MENU_SHARES = "📊 Инструменты"
 MENU_NEW_MONITOR = "🔔 Новый мониторинг"
 MENU_MONITORS = "🧭 Мои мониторинги"
 MENU_PORTFOLIO = "💼 Портфель"
+MENU_PORTFOLIO_ANALYSIS = "🤖 Анализ портфеля"
 MENU_OPERATIONS = "🕘 Операции"
 MENU_PROFILE = "🔐 Профиль T-Bank"
 MENU_ORDER = "🧾 Заявка"
@@ -74,7 +79,8 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=MENU_SHARES), KeyboardButton(text=MENU_NEW_MONITOR)],
         [KeyboardButton(text=MENU_MONITORS), KeyboardButton(text=MENU_PORTFOLIO)],
-        [KeyboardButton(text=MENU_OPERATIONS), KeyboardButton(text=MENU_PROFILE)],
+        [KeyboardButton(text=MENU_PORTFOLIO_ANALYSIS), KeyboardButton(text=MENU_OPERATIONS)],
+        [KeyboardButton(text=MENU_PROFILE)],
         [KeyboardButton(text=MENU_ORDER), KeyboardButton(text=MENU_STOP)],
         [KeyboardButton(text=MENU_ACTIVE_ORDERS)],
     ],
@@ -85,7 +91,8 @@ MAIN_MENU_KEYBOARD_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=MENU_SHARES), KeyboardButton(text=MENU_NEW_MONITOR)],
         [KeyboardButton(text=MENU_MONITORS), KeyboardButton(text=MENU_PORTFOLIO)],
-        [KeyboardButton(text=MENU_OPERATIONS), KeyboardButton(text=MENU_PROFILE)],
+        [KeyboardButton(text=MENU_PORTFOLIO_ANALYSIS), KeyboardButton(text=MENU_OPERATIONS)],
+        [KeyboardButton(text=MENU_PROFILE)],
         [KeyboardButton(text=MENU_ORDER), KeyboardButton(text=MENU_STOP)],
         [KeyboardButton(text=MENU_ACTIVE_ORDERS), KeyboardButton(text=MENU_ADMIN)],
     ],
@@ -115,6 +122,7 @@ ADM_CB_REFRESH = "adm:refresh"
 ADM_CB_USER_PREFIX = "adm:user"
 ADM_CB_APPROVE_PREFIX = "adm:approve"
 ADM_CB_REVOKE_PREFIX = "adm:revoke"
+PA_CB_PREFIX = "pa:h"
 
 
 async def _safe_telegram_call(coro):
@@ -148,6 +156,21 @@ async def _safe_delete_by_id(message: Message, message_id: int | None) -> None:
         await message.bot.delete_message(chat_id=message.chat.id, message_id=message_id)
     except Exception:
         return
+
+
+async def _send_long_text(message: Message, text: str, *, chunk_size: int = 3600) -> None:
+    if len(text) <= chunk_size:
+        await _safe_telegram_call(message.answer(text))
+        return
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        if end < len(text):
+            split_at = text.rfind("\n", start, end)
+            if split_at > start + 500:
+                end = split_at
+        await _safe_telegram_call(message.answer(text[start:end].strip()))
+        start = end
 
 
 def _menu_keyboard_for_user(telegram_user_id: int | None) -> ReplyKeyboardMarkup:
@@ -279,6 +302,21 @@ def _admin_request_keyboard(telegram_user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _portfolio_analysis_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="1 день", callback_data=f"{PA_CB_PREFIX}:1d"),
+                InlineKeyboardButton(text="7 дней", callback_data=f"{PA_CB_PREFIX}:7d"),
+            ],
+            [
+                InlineKeyboardButton(text="Месяц", callback_data=f"{PA_CB_PREFIX}:1m"),
+                InlineKeyboardButton(text="Год", callback_data=f"{PA_CB_PREFIX}:1y"),
+            ],
+        ]
+    )
+
+
 async def _notify_admins_access_request(message: Message, access_item: dict) -> None:
     if not message.from_user:
         return
@@ -303,14 +341,15 @@ async def _notify_admins_access_request(message: Message, access_item: dict) -> 
 
 def _list_header(total: int, page: int, total_pages: int) -> str:
     return (
-        "📈 <b>Российские акции (T-Bank)</b>\n"
+        "📊 <b>Инструменты T-Bank</b>\n"
         f"Всего: <b>{total}</b>\n"
         f"Страница: <b>{page}/{total_pages}</b>\n\n"
         "Кнопки сверху:\n"
         "• <b>Поиск</b> — найти по тикеру/FIGI/названию\n"
         "• <b>Избранное</b> — только ваши отмеченные бумаги\n"
-        "• <b>Все</b> — полный список\n\n"
-        "Выберите акцию для подробной информации:"
+        "• <b>Все</b> — полный список\n"
+        "• <b>Акции/Облигации/Фонды</b> — фильтр по типу\n\n"
+        "Выберите инструмент для подробной информации:"
     )
 
 
@@ -320,7 +359,24 @@ def _shares_mode_header(mode: str, query: str | None) -> str:
     if mode == "search":
         query_text = html.escape((query or "").strip() or "—")
         return f"Режим: <b>Поиск</b> · запрос: <code>{query_text}</code>\n"
-    return "Режим: <b>Все акции</b>\n"
+    return "Режим: <b>Все инструменты</b>\n"
+
+
+def _instrument_filter_label(value: str | None) -> str:
+    mapping = {
+        "share": "Акции",
+        "bond": "Облигации",
+        "etf": "Фонды",
+        "all": "Все типы",
+    }
+    return mapping.get(str(value or "all").strip().lower(), "Все типы")
+
+
+def _instrument_types_for_filter(value: str | None) -> list[str]:
+    normalized = str(value or "all").strip().lower()
+    if normalized in {"share", "bond", "etf"}:
+        return [normalized]
+    return ["share", "bond", "etf"]
 
 
 def _order_submit_error_text(exc: RuntimeError) -> str:
@@ -344,7 +400,10 @@ def _shares_filter_items(
     mode: str,
     query: str | None,
     favorites: set[str],
+    instrument_filter: str = "all",
 ) -> list[ShareViewItem]:
+    allowed_types = set(_instrument_types_for_filter(instrument_filter))
+    items = [item for item in items if item.instrument_type in allowed_types]
     if mode == "favorites":
         return [item for item in items if item.figi in favorites]
     if mode == "search":
@@ -653,6 +712,7 @@ MAIN_MENU_TEXTS = {
     MENU_NEW_MONITOR,
     MENU_MONITORS,
     MENU_PORTFOLIO,
+    MENU_PORTFOLIO_ANALYSIS,
     MENU_OPERATIONS,
     MENU_PROFILE,
     MENU_ORDER,
@@ -769,7 +829,7 @@ async def _load_items(state: FSMContext, force_refresh: bool = False) -> list[Sh
     if isinstance(cached_all_items, list) and cached_all_items and not force_refresh:
         return [ShareViewItem(**item) for item in cached_all_items]
 
-    all_items = await service.get_all_stored_shares(limit=3000)
+    all_items = await service.get_all_stored_shares(limit=5000)
     await state.update_data(shares_all_items=[asdict(item) for item in all_items])
     return all_items
 
@@ -794,6 +854,7 @@ async def _load_filtered_items(
     data = await state.get_data()
     mode = data.get("shares_mode") if isinstance(data.get("shares_mode"), str) else "all"
     query = data.get("shares_query") if isinstance(data.get("shares_query"), str) else ""
+    instrument_filter = data.get("instrument_filter") if isinstance(data.get("instrument_filter"), str) else "all"
     all_items = await _load_items(state=state, force_refresh=force_refresh)
     favorites = await _load_favorite_figies(state=state, telegram_user_id=telegram_user_id, force_refresh=force_refresh)
     filtered = _shares_filter_items(
@@ -801,6 +862,7 @@ async def _load_filtered_items(
         mode=mode,
         query=query,
         favorites=favorites,
+        instrument_filter=instrument_filter,
     )
     await state.update_data(shares_filtered_items=[asdict(item) for item in filtered])
     return filtered
@@ -816,13 +878,18 @@ async def _load_page_items(
     data = await state.get_data()
     mode = data.get("shares_mode") if isinstance(data.get("shares_mode"), str) else "all"
     query = data.get("shares_query") if isinstance(data.get("shares_query"), str) else ""
+    instrument_filter = data.get("instrument_filter") if isinstance(data.get("instrument_filter"), str) else "all"
     cached_page = data.get("cached_page")
     cached_items = data.get("shares_items_page")
     if isinstance(cached_page, int) and cached_page == page and isinstance(cached_items, list) and not force_refresh:
         return [ShareViewItem(**item) for item in cached_items]
 
     if mode == "all" and not (query or "").strip():
-        items, total, safe_page, total_pages = await service.get_shares_page(page=page, page_size=PAGE_SIZE)
+        items, total, safe_page, total_pages = await service.get_shares_page(
+            page=page,
+            page_size=PAGE_SIZE,
+            instrument_types=_instrument_types_for_filter(instrument_filter),
+        )
         await state.update_data(
             shares_items_page=[asdict(item) for item in items],
             cached_page=safe_page,
@@ -925,7 +992,7 @@ async def _show_page(message: Message, state: FSMContext, page: int, force_refre
             force_refresh=force_refresh,
         )
     except RuntimeError as exc:
-        await _safe_telegram_call(message.answer(f"Не удалось получить список акций: {exc}"))
+        await _safe_telegram_call(message.answer(f"Не удалось получить список инструментов: {exc}"))
         return
 
     data = await state.get_data()
@@ -934,6 +1001,7 @@ async def _show_page(message: Message, state: FSMContext, page: int, force_refre
     total_pages = data.get("total_pages") if isinstance(data.get("total_pages"), int) else 1
     mode = data.get("shares_mode") if isinstance(data.get("shares_mode"), str) else "all"
     query = data.get("shares_query") if isinstance(data.get("shares_query"), str) else ""
+    instrument_filter = data.get("instrument_filter") if isinstance(data.get("instrument_filter"), str) else "all"
     await state.set_state(SharesBrowserStates.browsing_list)
     await state.update_data(current_page=safe_page)
 
@@ -946,6 +1014,7 @@ async def _show_page(message: Message, state: FSMContext, page: int, force_refre
                 total_pages=total_pages,
                 mode=mode,
                 has_query=bool((query or "").strip()),
+                instrument_filter=instrument_filter,
             ),
         )
     )
@@ -964,7 +1033,7 @@ async def _edit_page(callback: CallbackQuery, state: FSMContext, page: int, forc
         )
     except RuntimeError as exc:
         if callback.message:
-            await _safe_telegram_call(callback.message.answer(f"Не удалось получить список акций: {exc}"))
+            await _safe_telegram_call(callback.message.answer(f"Не удалось получить список инструментов: {exc}"))
         return
 
     data = await state.get_data()
@@ -973,6 +1042,7 @@ async def _edit_page(callback: CallbackQuery, state: FSMContext, page: int, forc
     total_pages = data.get("total_pages") if isinstance(data.get("total_pages"), int) else 1
     mode = data.get("shares_mode") if isinstance(data.get("shares_mode"), str) else "all"
     query = data.get("shares_query") if isinstance(data.get("shares_query"), str) else ""
+    instrument_filter = data.get("instrument_filter") if isinstance(data.get("instrument_filter"), str) else "all"
     await state.set_state(SharesBrowserStates.browsing_list)
     await state.update_data(current_page=safe_page)
 
@@ -987,6 +1057,7 @@ async def _edit_page(callback: CallbackQuery, state: FSMContext, page: int, forc
                         total_pages=total_pages,
                         mode=mode,
                         has_query=bool((query or "").strip()),
+                        instrument_filter=instrument_filter,
                     ),
                 )
             )
@@ -1263,6 +1334,7 @@ async def open_shares(message: Message, state: FSMContext) -> None:
     await state.update_data(
         shares_mode="all",
         shares_query="",
+        instrument_filter="all",
         cached_page=None,
         shares_items_page=None,
     )
@@ -1929,6 +2001,55 @@ async def show_portfolio(message: Message) -> None:
     )
 
 
+@router.message(F.text == MENU_PORTFOLIO_ANALYSIS)
+async def portfolio_analysis_start(message: Message) -> None:
+    if not message.from_user:
+        return
+    if not await _ensure_user_credentials(message):
+        return
+    await _safe_telegram_call(
+        message.answer(
+            "🤖 <b>Анализ портфеля</b>\n"
+            "Выберите срок прогноза. Бот соберет текущий портфель T-Bank и отправит его AI-аналитику.",
+            reply_markup=_portfolio_analysis_keyboard(),
+        )
+    )
+
+
+@router.callback_query(F.data.startswith(f"{PA_CB_PREFIX}:"))
+async def portfolio_analysis_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    horizon = str(callback.data or "").split(":", maxsplit=1)[-1]
+    await _safe_telegram_call(callback.answer("Готовлю анализ..."))
+    await _safe_telegram_call(
+        callback.message.answer(
+            "Собираю портфель и формирую AI-отчет. Обычно это занимает до минуты."
+        )
+    )
+    try:
+        payload = await service.analyze_portfolio(callback.from_user.id, horizon=horizon)
+    except RuntimeError as exc:
+        await _safe_telegram_call(callback.message.answer(f"Не удалось выполнить анализ портфеля: {exc}"))
+        return
+
+    report = str(payload.get("report") or "").strip()
+    horizon_label = str(payload.get("horizon_label") or horizon)
+    generated_at = _format_datetime(str(payload.get("generated_at_msk") or ""))
+    model = str(payload.get("model") or "AI")
+    if not report:
+        await _safe_telegram_call(callback.message.answer("AI вернул пустой отчет. Попробуйте повторить позже."))
+        return
+    text = (
+        f"🤖 <b>AI-анализ портфеля</b>\n"
+        f"Срок: <b>{html.escape(horizon_label)}</b>\n"
+        f"Дата МСК: <b>{html.escape(generated_at)}</b>\n"
+        f"Модель: <code>{html.escape(model)}</code>\n\n"
+        f"{html.escape(report)}"
+    )
+    await _send_long_text(callback.message, text)
+
+
 @router.message(F.text == MENU_OPERATIONS)
 async def operations_start(message: Message, state: FSMContext) -> None:
     if not message.from_user:
@@ -2520,7 +2641,7 @@ async def shares_search_query_input(message: Message, state: FSMContext) -> None
 
 @router.callback_query(F.data == CB_MODE_ALL)
 async def shares_all_mode_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    await _safe_telegram_call(callback.answer("\u041f\u043e\u043a\u0430\u0437\u044b\u0432\u0430\u044e \u0432\u0441\u0435 \u0430\u043a\u0446\u0438\u0438"))
+    await _safe_telegram_call(callback.answer("Показываю все инструменты"))
     await state.update_data(
         shares_mode="all",
         shares_query="",
@@ -2540,6 +2661,24 @@ async def shares_favorites_mode_callback(callback: CallbackQuery, state: FSMCont
         shares_items_page=None,
     )
     await _edit_page(callback=callback, state=state, page=1, force_refresh=False)
+
+
+@router.callback_query(F.data.in_({CB_TYPE_ALL, CB_TYPE_SHARE, CB_TYPE_BOND, CB_TYPE_ETF}))
+async def instruments_type_filter_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    mapping = {
+        CB_TYPE_ALL: "all",
+        CB_TYPE_SHARE: "share",
+        CB_TYPE_BOND: "bond",
+        CB_TYPE_ETF: "etf",
+    }
+    instrument_filter = mapping.get(callback.data or "", "all")
+    await _safe_telegram_call(callback.answer(f"Фильтр: {_instrument_filter_label(instrument_filter)}"))
+    await state.update_data(
+        instrument_filter=instrument_filter,
+        cached_page=None,
+        shares_items_page=None,
+    )
+    await _edit_page(callback=callback, state=state, page=1, force_refresh=True)
 
 
 @router.callback_query(F.data.startswith(f"{CB_FAVORITE_TOGGLE_PREFIX}:"))
@@ -2658,7 +2797,7 @@ async def open_details(callback: CallbackQuery, state: FSMContext) -> None:
         item = await service.get_share_details_online(figi)
     except RuntimeError as exc:
         if callback.message:
-            await _safe_telegram_call(callback.message.answer(f"Не удалось получить данные акции онлайн: {exc}"))
+            await _safe_telegram_call(callback.message.answer(f"Не удалось получить данные инструмента онлайн: {exc}"))
         return
     if item is None:
         if callback.message:
@@ -2711,6 +2850,9 @@ async def _open_menu_section(message: Message, state: FSMContext, text: str) -> 
     if _menu_text_equals(normalized_text, MENU_PORTFOLIO):
         await show_portfolio(message)
         return
+    if _menu_text_equals(normalized_text, MENU_PORTFOLIO_ANALYSIS):
+        await portfolio_analysis_start(message)
+        return
     if _menu_text_equals(normalized_text, MENU_OPERATIONS):
         await operations_start(message, state)
         return
@@ -2750,6 +2892,7 @@ def _share_details_text_legacy(item: ShareViewItem) -> str:
 
     return (
         f"📊 <b>{item.name}</b>\n"
+        f"Тип: <b>{_instrument_filter_label(item.instrument_type)}</b>\n"
         f"Тикер: <b>{item.ticker}</b>\n"
         f"FIGI: <code>{item.figi}</code>\n\n"
         f"Цена (последняя): <b>{_format_price(item.last_price, item.currency)}</b>\n"
