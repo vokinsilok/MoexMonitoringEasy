@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import asdict
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import html
 import json
 import re
+import tempfile
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
@@ -13,6 +16,7 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -46,6 +50,7 @@ from bot_service.states import SharesBrowserStates
 
 router = Router()
 service = TelegramSharesBrowserService()
+BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 # User-facing labels (kept explicit to avoid mojibake regressions).
 MENU_SHARES = "📊 Инструменты"
@@ -325,6 +330,101 @@ def _analysis_horizon_label(horizon: str | None) -> str:
         "1y": "1 год",
     }
     return mapping.get(str(horizon or "").strip().lower(), "выбранный срок")
+
+
+def _track_background_task(task: asyncio.Task) -> None:
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+
+
+def _analysis_docx_path(telegram_user_id: int, horizon: str) -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"portfolio_analysis_{telegram_user_id}_{horizon}_{timestamp}.docx"
+    return Path(tempfile.gettempdir()) / filename
+
+
+def _write_portfolio_analysis_docx(payload: dict, path: Path) -> None:
+    from docx import Document
+    from docx.shared import Pt
+
+    report = str(payload.get("report") or "").strip()
+    horizon_label = str(payload.get("horizon_label") or "—")
+    generated_at = _format_datetime(str(payload.get("generated_at_msk") or ""))
+    model = str(payload.get("model") or "AI")
+
+    document = Document()
+    styles = document.styles
+    styles["Normal"].font.name = "Arial"
+    styles["Normal"].font.size = Pt(10)
+
+    document.add_heading("AI-анализ портфеля", level=1)
+    meta = document.add_paragraph()
+    meta.add_run("Горизонт: ").bold = True
+    meta.add_run(horizon_label)
+    meta.add_run("\nДата МСК: ").bold = True
+    meta.add_run(generated_at)
+    meta.add_run("\nМодель: ").bold = True
+    meta.add_run(model)
+
+    document.add_paragraph("")
+    for block in report.split("\n"):
+        line = block.strip()
+        if not line:
+            document.add_paragraph("")
+            continue
+        if line.startswith(("1)", "1.", "2)", "2.", "3)", "3.", "4)", "4.", "5)", "5.", "6)", "6.")):
+            document.add_heading(line, level=2)
+        elif line.startswith(("-", "•")):
+            document.add_paragraph(line.lstrip("-• ").strip(), style="List Bullet")
+        else:
+            document.add_paragraph(line)
+
+    document.add_paragraph("")
+    note = document.add_paragraph("Не является индивидуальной инвестиционной рекомендацией.")
+    note.runs[0].italic = True
+    document.save(path)
+
+
+async def _send_portfolio_analysis_document(
+    *,
+    bot: Bot,
+    chat_id: int,
+    telegram_user_id: int,
+    horizon: str,
+    horizon_label: str,
+) -> None:
+    path = _analysis_docx_path(telegram_user_id, horizon)
+    try:
+        payload = await service.analyze_portfolio(telegram_user_id, horizon=horizon)
+        report = str(payload.get("report") or "").strip()
+        if not report:
+            await bot.send_message(chat_id=chat_id, text="AI вернул пустой отчет. Попробуйте повторить позже.")
+            return
+
+        await asyncio.to_thread(_write_portfolio_analysis_docx, payload, path)
+        generated_at = _format_datetime(str(payload.get("generated_at_msk") or ""))
+        caption = (
+            "🤖 <b>AI-анализ портфеля готов</b>\n"
+            f"Горизонт: <b>{html.escape(str(payload.get('horizon_label') or horizon_label))}</b>\n"
+            f"Дата МСК: <b>{html.escape(generated_at)}</b>"
+        )
+        await bot.send_document(
+            chat_id=chat_id,
+            document=FSInputFile(str(path), filename=f"AI-анализ портфеля {horizon_label}.docx"),
+            caption=caption,
+        )
+    except RuntimeError as exc:
+        await bot.send_message(chat_id=chat_id, text=_portfolio_analysis_error_text(exc))
+    except Exception:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="Не получилось сформировать Word-файл с отчетом. Попробуйте повторить анализ чуть позже.",
+        )
+    finally:
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 async def _notify_admins_access_request(message: Message, access_item: dict) -> None:
@@ -2086,30 +2186,19 @@ async def portfolio_analysis_callback(callback: CallbackQuery) -> None:
         callback.message.answer(
             "🤖 <b>Запустил анализ портфеля</b>\n"
             f"Горизонт: <b>{html.escape(horizon_label)}</b>\n\n"
-            "Собираю позиции, структуру и доходность. Обычно отчет готов за 30–120 секунд."
+            "Собираю позиции, структуру и доходность в фоне. Когда отчет будет готов, пришлю его Word-файлом в этот чат."
         )
     )
-    try:
-        payload = await service.analyze_portfolio(callback.from_user.id, horizon=horizon)
-    except RuntimeError as exc:
-        await _safe_telegram_call(callback.message.answer(_portfolio_analysis_error_text(exc)))
-        return
-
-    report = str(payload.get("report") or "").strip()
-    horizon_label = str(payload.get("horizon_label") or horizon_label)
-    generated_at = _format_datetime(str(payload.get("generated_at_msk") or ""))
-    model = str(payload.get("model") or "AI")
-    if not report:
-        await _safe_telegram_call(callback.message.answer("AI вернул пустой отчет. Попробуйте повторить позже."))
-        return
-    text = (
-        f"🤖 <b>AI-анализ портфеля</b>\n"
-        f"Срок: <b>{html.escape(horizon_label)}</b>\n"
-        f"Дата МСК: <b>{html.escape(generated_at)}</b>\n"
-        f"Модель: <code>{html.escape(model)}</code>\n\n"
-        f"{html.escape(report)}"
+    task = asyncio.create_task(
+        _send_portfolio_analysis_document(
+            bot=callback.bot,
+            chat_id=callback.message.chat.id,
+            telegram_user_id=callback.from_user.id,
+            horizon=horizon,
+            horizon_label=horizon_label,
+        )
     )
-    await _send_long_text(callback.message, text)
+    _track_background_task(task)
 
 
 @router.message(F.text == MENU_OPERATIONS)
