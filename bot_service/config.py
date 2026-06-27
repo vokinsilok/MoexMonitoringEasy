@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     REDIS_HOST: str = "redis"
     REDIS_PORT: int = 6379
     TBANK_MONITOR_EVENTS_QUEUE_KEY: str = "tbank:monitor:events"
+    TBANK_CALENDAR_EVENTS_QUEUE_KEY: str = "tbank:calendar:events"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

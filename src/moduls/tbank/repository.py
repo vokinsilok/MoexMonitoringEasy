@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -6,6 +6,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from src.moduls.base.base import BaseRepository
 from src.moduls.tbank.models import (
     TBankBotAccessUser,
+    TBankCalendarNotificationLog,
+    TBankCalendarNotificationSetting,
     TBankFavoriteShare,
     TBankPriceMonitor,
     TBankShare,
@@ -113,6 +115,21 @@ class TBankShareRepository(BaseRepository):
         )
         result = await self.session.execute(stmt)
         return result.scalars().first()
+
+    async def list_active_by_figies(self, figies: list[str]) -> list[TBankShare]:
+        unique_figies = list(dict.fromkeys([figi.strip() for figi in figies if figi and figi.strip()]))
+        if not unique_figies:
+            return []
+        order_map = {figi: index for index, figi in enumerate(unique_figies)}
+        stmt = (
+            select(self.model)
+            .where(self.model.figi.in_(unique_figies))
+            .where(self.model.is_active.is_(True))
+        )
+        result = await self.session.execute(stmt)
+        rows = list(result.scalars().all())
+        rows.sort(key=lambda row: order_map.get(row.figi, len(order_map)))
+        return rows
 
     @staticmethod
     def _normalize_instrument_types(instrument_types: list[str] | None) -> list[str]:
@@ -222,6 +239,106 @@ class TBankFavoriteShareRepository(BaseRepository):
         )
         result = await self.session.execute(stmt)
         return result.scalar_one_or_none() is not None
+
+    async def list_user_ids_with_favorites(self) -> list[int]:
+        stmt = (
+            select(self.model.telegram_user_id)
+            .group_by(self.model.telegram_user_id)
+            .order_by(self.model.telegram_user_id.asc())
+        )
+        result = await self.session.execute(stmt)
+        return [int(user_id) for user_id in result.scalars().all() if user_id]
+
+
+class TBankCalendarNotificationSettingRepository(BaseRepository):
+    model = TBankCalendarNotificationSetting
+
+    async def get_or_create(self, telegram_user_id: int) -> TBankCalendarNotificationSetting:
+        stmt = (
+            select(self.model)
+            .where(self.model.telegram_user_id == telegram_user_id)
+            .limit(1)
+        )
+        result = await self.session.execute(stmt)
+        row = result.scalars().first()
+        if row is not None:
+            return row
+
+        insert_stmt = pg_insert(self.model).values(
+            telegram_user_id=telegram_user_id,
+            enabled=True,
+            days_before=3,
+            updated_at=datetime.now(timezone.utc),
+        ).returning(self.model)
+        result = await self.session.execute(insert_stmt)
+        return result.scalar_one()
+
+    async def upsert(
+        self,
+        *,
+        telegram_user_id: int,
+        enabled: bool,
+        days_before: int,
+    ) -> TBankCalendarNotificationSetting:
+        now = datetime.now(timezone.utc)
+        insert_stmt = pg_insert(self.model).values(
+            telegram_user_id=telegram_user_id,
+            enabled=enabled,
+            days_before=days_before,
+            updated_at=now,
+        )
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=[self.model.telegram_user_id],
+            set_={
+                "enabled": insert_stmt.excluded.enabled,
+                "days_before": insert_stmt.excluded.days_before,
+                "updated_at": now,
+            },
+        ).returning(self.model)
+        result = await self.session.execute(upsert_stmt)
+        return result.scalar_one()
+
+    async def list_enabled(self) -> list[TBankCalendarNotificationSetting]:
+        stmt = (
+            select(self.model)
+            .where(self.model.enabled.is_(True))
+            .order_by(self.model.telegram_user_id.asc())
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+
+class TBankCalendarNotificationLogRepository(BaseRepository):
+    model = TBankCalendarNotificationLog
+
+    async def mark_notified(
+        self,
+        *,
+        telegram_user_id: int,
+        figi: str,
+        event_type: str,
+        event_date: date,
+        days_before: int,
+        notified_at_msk: datetime,
+    ) -> bool:
+        insert_stmt = pg_insert(self.model).values(
+            telegram_user_id=telegram_user_id,
+            figi=figi,
+            event_type=event_type,
+            event_date=event_date,
+            days_before=days_before,
+            notified_at_msk=notified_at_msk,
+        ).on_conflict_do_nothing(
+            index_elements=[
+                self.model.telegram_user_id,
+                self.model.figi,
+                self.model.event_type,
+                self.model.event_date,
+                self.model.days_before,
+            ],
+        )
+        result = await self.session.execute(insert_stmt)
+        return bool(result.rowcount)
 
 
 class TBankBotAccessUserRepository(BaseRepository):

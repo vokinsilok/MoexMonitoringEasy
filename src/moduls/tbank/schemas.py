@@ -164,6 +164,54 @@ class TBankFavoriteSharesResponse(BaseModel):
     figies: list[str]
 
 
+class TBankCalendarEventItem(BaseModel):
+    event_id: str
+    event_type: str
+    event_type_label: str
+    event_date: str
+    days_left: int
+    figi: str
+    ticker: str | None = None
+    instrument_name: str | None = None
+    instrument_type: str | None = None
+    amount: str | None = None
+    currency: str | None = None
+    yield_percent: str | None = None
+    description: str | None = None
+
+
+class TBankCalendarResponse(BaseModel):
+    telegram_user_id: int
+    days_ahead: int
+    total: int
+    items: list[TBankCalendarEventItem]
+    errors: list[str] = Field(default_factory=list)
+
+
+class TBankCalendarNotificationSettingsRequest(BaseModel):
+    telegram_user_id: int = Field(..., ge=1)
+    enabled: bool = True
+    days_before: int = Field(default=3, ge=0, le=365)
+
+
+class TBankCalendarNotificationSettingsResponse(BaseModel):
+    telegram_user_id: int
+    enabled: bool
+    days_before: int
+
+
+class TBankCalendarNotificationEvent(TBankCalendarEventItem):
+    telegram_user_id: int
+    days_before: int
+    notified_at_msk: str
+
+
+class TBankCalendarNotificationCheckResponse(BaseModel):
+    checked_users: int
+    notifications: int
+    events: list[TBankCalendarNotificationEvent]
+
+
 class TBankBotAccessRequest(BaseModel):
     telegram_user_id: int = Field(..., ge=1)
     username: str | None = None

@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     TBANK_SYNC_INTERVAL_SECONDS: int = 120
     TBANK_MONITOR_CHECK_INTERVAL_SECONDS: int = 30
     TBANK_MONITOR_EVENTS_QUEUE_KEY: str = "tbank:monitor:events"
+    TBANK_CALENDAR_CHECK_INTERVAL_SECONDS: int = 3600
+    TBANK_CALENDAR_EVENTS_QUEUE_KEY: str = "tbank:calendar:events"
     TBANK_CLOSED_STATUS_REFRESH_SECONDS: int = 1800
 
     AI_API_KEY: str = ""
@@ -48,6 +50,13 @@ class Settings(BaseSettings):
     def validate_tbank_monitor_check_interval(cls, value):
         if value in (None, ""):
             return 30
+        return value
+
+    @field_validator("TBANK_CALENDAR_CHECK_INTERVAL_SECONDS", mode="before")
+    @classmethod
+    def validate_tbank_calendar_check_interval(cls, value):
+        if value in (None, ""):
+            return 3600
         return value
 
     @field_validator("TBANK_CLOSED_STATUS_REFRESH_SECONDS", mode="before")

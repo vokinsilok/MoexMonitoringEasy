@@ -5,7 +5,7 @@ from src.connectors.redis_connector import RedisManager
 from src.connectors.tbank_invest_connector import TBankInvestConnector
 from src.core.config import settings
 from src.db.database import async_session_maker
-from src.moduls.tbank.service import TBankMonitorService, TBankSharesService
+from src.moduls.tbank.service import TBankCalendarService, TBankMonitorService, TBankSharesService
 from src.tasks.broker import broker
 from src.utils.db_manager import DBManager
 
@@ -83,6 +83,30 @@ async def check_all_monitors_task() -> dict[str, Any]:
                     ]
                     if serialized_events:
                         await cache.rpush(queue_key, *serialized_events)
+                return payload
+    finally:
+        await _close_cache(cache)
+
+
+@broker.task(task_name="tbank.check_calendar_notifications")
+async def check_calendar_notifications_task() -> dict[str, Any]:
+    connector = _build_connector()
+    cache = await _connect_cache()
+    try:
+        async with DBManager(session_factory=async_session_maker) as db:
+            async with db.transaction():
+                service = TBankCalendarService(db=db, connector=connector)
+                result = await service.check_all_notifications()
+                payload = result.model_dump()
+                events = payload.get("events")
+                if cache is not None and isinstance(events, list) and events:
+                    serialized_events = [
+                        json.dumps(event, ensure_ascii=False)
+                        for event in events
+                        if isinstance(event, dict)
+                    ]
+                    if serialized_events:
+                        await cache.rpush(settings.TBANK_CALENDAR_EVENTS_QUEUE_KEY, *serialized_events)
                 return payload
     finally:
         await _close_cache(cache)

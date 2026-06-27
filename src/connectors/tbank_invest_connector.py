@@ -266,6 +266,63 @@ class TBankInvestConnector:
             raise errors[-1]
         raise TBankInvestRequestError(f"Instrument with FIGI '{figi_value}' not found")
 
+    async def get_dividends(
+        self,
+        *,
+        figi: str,
+        from_date: datetime,
+        to_date: datetime,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request_json(
+            "/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetDividends",
+            {
+                "instrumentId": figi.strip(),
+                "from": self._to_utc_rfc3339(from_date),
+                "to": self._to_utc_rfc3339(to_date),
+            },
+        )
+        raw_items = payload.get("dividends")
+        return raw_items if isinstance(raw_items, list) else []
+
+    async def get_bond_coupons(
+        self,
+        *,
+        figi: str,
+        from_date: datetime,
+        to_date: datetime,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request_json(
+            "/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetBondCoupons",
+            {
+                "instrumentId": figi.strip(),
+                "from": self._to_utc_rfc3339(from_date),
+                "to": self._to_utc_rfc3339(to_date),
+            },
+        )
+        raw_items = payload.get("events")
+        if isinstance(raw_items, list):
+            return raw_items
+        raw_items = payload.get("coupons")
+        return raw_items if isinstance(raw_items, list) else []
+
+    async def get_bond_events(
+        self,
+        *,
+        figi: str,
+        from_date: datetime,
+        to_date: datetime,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request_json(
+            "/rest/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetBondEvents",
+            {
+                "instrumentId": figi.strip(),
+                "from": self._to_utc_rfc3339(from_date),
+                "to": self._to_utc_rfc3339(to_date),
+            },
+        )
+        raw_items = payload.get("events")
+        return raw_items if isinstance(raw_items, list) else []
+
     async def get_daily_metrics(
         self,
         *,

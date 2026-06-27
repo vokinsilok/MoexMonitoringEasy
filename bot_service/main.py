@@ -111,6 +111,27 @@ def _render_monitor_text(event: dict, monitor_id: int) -> str:
     )
 
 
+def _render_calendar_notification_text(event: dict) -> str:
+    ticker = event.get("ticker") or event.get("figi") or "Инструмент"
+    event_type = event.get("event_type_label") or event.get("event_type") or "Событие"
+    event_date = event.get("event_date") or "—"
+    days_before = event.get("days_before")
+    amount = event.get("amount")
+    currency = event.get("currency")
+    amount_text = f"\nСумма: <b>{amount} {currency or ''}</b>" if amount else ""
+    description = event.get("description")
+    description_text = f"\n{description}" if description else ""
+    return (
+        "🗓 <b>Календарное уведомление</b>\n"
+        f"Инструмент: <b>{ticker}</b>\n"
+        f"Событие: <b>{event_type}</b>\n"
+        f"Дата: <b>{event_date}</b>\n"
+        f"Напоминание: <b>за {days_before} дн.</b>"
+        f"{amount_text}"
+        f"{description_text}"
+    )
+
+
 async def _run_monitor_consumer(bot: Bot, stop_event: asyncio.Event) -> None:
     queue_key = settings.TBANK_MONITOR_EVENTS_QUEUE_KEY
     redis_client = None
@@ -162,6 +183,55 @@ async def _run_monitor_consumer(bot: Bot, stop_event: asyncio.Event) -> None:
             pass
 
 
+async def _run_calendar_consumer(bot: Bot, stop_event: asyncio.Event) -> None:
+    queue_key = settings.TBANK_CALENDAR_EVENTS_QUEUE_KEY
+    redis_client = None
+
+    while not stop_event.is_set():
+        try:
+            if redis_client is None:
+                redis_client = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT)
+                await redis_client.ping()
+
+            item = await redis_client.blpop(queue_key, timeout=5)
+            if item is None:
+                continue
+
+            _, raw_payload = item
+            if isinstance(raw_payload, bytes):
+                raw_payload = raw_payload.decode("utf-8", errors="ignore")
+            if not isinstance(raw_payload, str):
+                continue
+
+            event = json.loads(raw_payload)
+            if not isinstance(event, dict):
+                continue
+
+            telegram_user_id = event.get("telegram_user_id")
+            if not isinstance(telegram_user_id, int):
+                continue
+
+            await bot.send_message(
+                chat_id=telegram_user_id,
+                text=_render_calendar_notification_text(event),
+            )
+        except Exception as exc:
+            main_logger.info(f"Calendar consumer error: {exc}")
+            if redis_client is not None:
+                try:
+                    await redis_client.aclose()
+                except Exception:
+                    pass
+                redis_client = None
+            await asyncio.sleep(2)
+
+    if redis_client is not None:
+        try:
+            await redis_client.aclose()
+        except Exception:
+            pass
+
+
 async def main() -> None:
     token = settings.TELEGRAM_BOT_TOKEN.strip()
     if not token:
@@ -179,6 +249,7 @@ async def main() -> None:
         bot = _build_bot(token=token, use_proxy=use_proxy)
         stop_event = asyncio.Event()
         monitor_task = asyncio.create_task(_run_monitor_consumer(bot=bot, stop_event=stop_event))
+        calendar_task = asyncio.create_task(_run_calendar_consumer(bot=bot, stop_event=stop_event))
         try:
             await dispatcher.start_polling(bot)
             return
@@ -198,6 +269,10 @@ async def main() -> None:
             stop_event.set()
             try:
                 await monitor_task
+            except Exception:
+                pass
+            try:
+                await calendar_task
             except Exception:
                 pass
             await bot.session.close()

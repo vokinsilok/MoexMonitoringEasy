@@ -24,6 +24,8 @@ services:
       TBANK_SYNC_INTERVAL_SECONDS: ${TBANK_SYNC_INTERVAL_SECONDS:-120}
       TBANK_MONITOR_CHECK_INTERVAL_SECONDS: ${TBANK_MONITOR_CHECK_INTERVAL_SECONDS:-30}
       TBANK_MONITOR_EVENTS_QUEUE_KEY: ${TBANK_MONITOR_EVENTS_QUEUE_KEY:-tbank:monitor:events}
+      TBANK_CALENDAR_CHECK_INTERVAL_SECONDS: ${TBANK_CALENDAR_CHECK_INTERVAL_SECONDS:-3600}
+      TBANK_CALENDAR_EVENTS_QUEUE_KEY: ${TBANK_CALENDAR_EVENTS_QUEUE_KEY:-tbank:calendar:events}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_BASE_URL: ${AI_BASE_URL:-https://api.proxyapi.ru/openrouter/v1}
       AI_MODEL: ${AI_MODEL:-openai/gpt-5.2}
@@ -57,6 +59,7 @@ services:
       REDIS_HOST: ${REDIS_HOST}
       REDIS_PORT: ${REDIS_PORT}
       TBANK_MONITOR_EVENTS_QUEUE_KEY: ${TBANK_MONITOR_EVENTS_QUEUE_KEY:-tbank:monitor:events}
+      TBANK_CALENDAR_EVENTS_QUEUE_KEY: ${TBANK_CALENDAR_EVENTS_QUEUE_KEY:-tbank:calendar:events}
     depends_on:
       backend:
         condition: service_started
@@ -84,6 +87,7 @@ services:
       TASKIQ_QUEUE_NAME: ${TASKIQ_QUEUE_NAME}
       TBANK_SYNC_INTERVAL_SECONDS: ${TBANK_SYNC_INTERVAL_SECONDS:-120}
       TBANK_MONITOR_EVENTS_QUEUE_KEY: ${TBANK_MONITOR_EVENTS_QUEUE_KEY:-tbank:monitor:events}
+      TBANK_CALENDAR_EVENTS_QUEUE_KEY: ${TBANK_CALENDAR_EVENTS_QUEUE_KEY:-tbank:calendar:events}
     depends_on:
       postgres:
         condition: service_healthy

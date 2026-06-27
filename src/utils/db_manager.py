@@ -9,6 +9,8 @@ class DBManager:
         self.session = self.session_factory()
         from src.moduls.tbank.repository import (
             TBankBotAccessUserRepository,
+            TBankCalendarNotificationLogRepository,
+            TBankCalendarNotificationSettingRepository,
             TBankFavoriteShareRepository,
             TBankPriceMonitorRepository,
             TBankShareRepository,
@@ -20,6 +22,8 @@ class DBManager:
         self.tbank_favorite_share = TBankFavoriteShareRepository(self.session)
         self.tbank_bot_access_user = TBankBotAccessUserRepository(self.session)
         self.tbank_price_monitor = TBankPriceMonitorRepository(self.session)
+        self.tbank_calendar_notification_setting = TBankCalendarNotificationSettingRepository(self.session)
+        self.tbank_calendar_notification_log = TBankCalendarNotificationLogRepository(self.session)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):

@@ -353,6 +353,38 @@ class TelegramSharesBrowserService:
             {"telegram_user_id": telegram_user_id, "figi": figi},
         )
 
+    async def get_calendar(self, telegram_user_id: int, days_ahead: int = 180) -> dict:
+        return await self._get_payload(
+            f"/api/v1/tbank/calendar?telegram_user_id={telegram_user_id}&days_ahead={days_ahead}"
+        )
+
+    async def get_calendar_settings(self, telegram_user_id: int) -> dict:
+        return await self._get_payload(
+            f"/api/v1/tbank/calendar/settings?telegram_user_id={telegram_user_id}"
+        )
+
+    async def update_calendar_settings(
+        self,
+        telegram_user_id: int,
+        *,
+        enabled: bool,
+        days_before: int,
+    ) -> dict:
+        return await self._post_payload(
+            "/api/v1/tbank/calendar/settings",
+            {
+                "telegram_user_id": telegram_user_id,
+                "enabled": enabled,
+                "days_before": days_before,
+            },
+        )
+
+    async def check_calendar_notifications(self, telegram_user_id: int) -> dict:
+        return await self._post_payload(
+            "/api/v1/tbank/calendar/notifications/check",
+            {"telegram_user_id": telegram_user_id},
+        )
+
     async def get_all_stored_shares(
         self,
         limit: int = 5000,

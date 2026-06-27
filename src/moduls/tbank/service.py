@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -12,6 +12,11 @@ from src.connectors.tbank_invest_connector import (
 )
 from src.connectors.redis_connector import RedisManager
 from src.moduls.tbank.schemas import (
+    TBankCalendarEventItem,
+    TBankCalendarNotificationCheckResponse,
+    TBankCalendarNotificationEvent,
+    TBankCalendarNotificationSettingsResponse,
+    TBankCalendarResponse,
     TBankMonitorGlobalCheckResponse,
     TBankMonitorCheckResponse,
     TBankMonitorCreateRequest,
@@ -1277,6 +1282,332 @@ class TBankPortfolioAnalysisService:
             return None
         value = str(raw_value).strip()
         return value or None
+
+
+class TBankCalendarService:
+    _EVENT_LABELS = {
+        "dividend": "Дивиденд",
+        "coupon": "Купон",
+        "maturity": "Погашение",
+        "offer": "Оферта",
+        "conversion": "Конвертация",
+        "bond_event": "Событие облигации",
+    }
+
+    def __init__(self, db: DBManager, connector: TBankInvestConnector) -> None:
+        self.db = db
+        self.connector = connector
+
+    async def list_calendar(
+        self,
+        *,
+        telegram_user_id: int,
+        days_ahead: int = 180,
+    ) -> TBankCalendarResponse:
+        safe_days = min(max(days_ahead, 1), 730)
+        today_msk = datetime.now(ZoneInfo("Europe/Moscow")).date()
+        from_utc = datetime.combine(today_msk, time.min, tzinfo=ZoneInfo("Europe/Moscow")).astimezone(timezone.utc)
+        to_utc = from_utc + timedelta(days=safe_days + 1)
+        figies = await self.db.tbank_favorite_share.list_figies_by_user(telegram_user_id)
+        instruments = await self.db.tbank_share.list_active_by_figies(figies)
+        events: list[TBankCalendarEventItem] = []
+        errors: list[str] = []
+
+        for instrument in instruments:
+            try:
+                events.extend(
+                    await self._load_instrument_events(
+                        instrument=instrument,
+                        today_msk=today_msk,
+                        from_utc=from_utc,
+                        to_utc=to_utc,
+                    )
+                )
+            except TBankInvestRequestError as exc:
+                errors.append(f"{instrument.ticker or instrument.figi}: {exc}")
+
+        events.sort(key=lambda item: (item.event_date, item.event_type, item.ticker or item.figi))
+        return TBankCalendarResponse(
+            telegram_user_id=telegram_user_id,
+            days_ahead=safe_days,
+            total=len(events),
+            items=events,
+            errors=errors[:10],
+        )
+
+    async def get_notification_settings(self, telegram_user_id: int) -> TBankCalendarNotificationSettingsResponse:
+        row = await self.db.tbank_calendar_notification_setting.get_or_create(telegram_user_id)
+        return self._settings_response(row)
+
+    async def update_notification_settings(
+        self,
+        *,
+        telegram_user_id: int,
+        enabled: bool,
+        days_before: int,
+    ) -> TBankCalendarNotificationSettingsResponse:
+        row = await self.db.tbank_calendar_notification_setting.upsert(
+            telegram_user_id=telegram_user_id,
+            enabled=enabled,
+            days_before=min(max(days_before, 0), 365),
+        )
+        return self._settings_response(row)
+
+    async def check_notifications(
+        self,
+        *,
+        telegram_user_id: int,
+    ) -> TBankCalendarNotificationCheckResponse:
+        settings = await self.db.tbank_calendar_notification_setting.get_or_create(telegram_user_id)
+        if not settings.enabled:
+            return TBankCalendarNotificationCheckResponse(checked_users=1, notifications=0, events=[])
+        events = await self._notification_events_for_user(
+            telegram_user_id=telegram_user_id,
+            days_before=int(settings.days_before),
+        )
+        return TBankCalendarNotificationCheckResponse(
+            checked_users=1,
+            notifications=len(events),
+            events=events,
+        )
+
+    async def check_all_notifications(self) -> TBankCalendarNotificationCheckResponse:
+        settings_rows = await self.db.tbank_calendar_notification_setting.list_enabled()
+        favorite_user_ids = set(await self.db.tbank_favorite_share.list_user_ids_with_favorites())
+        events: list[TBankCalendarNotificationEvent] = []
+        checked = 0
+        for row in settings_rows:
+            if int(row.telegram_user_id) not in favorite_user_ids:
+                continue
+            checked += 1
+            events.extend(
+                await self._notification_events_for_user(
+                    telegram_user_id=int(row.telegram_user_id),
+                    days_before=int(row.days_before),
+                )
+            )
+        return TBankCalendarNotificationCheckResponse(
+            checked_users=checked,
+            notifications=len(events),
+            events=events,
+        )
+
+    async def _notification_events_for_user(
+        self,
+        *,
+        telegram_user_id: int,
+        days_before: int,
+    ) -> list[TBankCalendarNotificationEvent]:
+        calendar = await self.list_calendar(
+            telegram_user_id=telegram_user_id,
+            days_ahead=max(days_before, 1),
+        )
+        today_msk = datetime.now(ZoneInfo("Europe/Moscow")).date()
+        target_date = today_msk + timedelta(days=days_before)
+        notified_at_msk = datetime.now(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+        notifications: list[TBankCalendarNotificationEvent] = []
+        for item in calendar.items:
+            event_date = self._parse_date(item.event_date)
+            if event_date != target_date:
+                continue
+            inserted = await self.db.tbank_calendar_notification_log.mark_notified(
+                telegram_user_id=telegram_user_id,
+                figi=item.figi,
+                event_type=item.event_type,
+                event_date=event_date,
+                days_before=days_before,
+                notified_at_msk=notified_at_msk,
+            )
+            if not inserted:
+                continue
+            notifications.append(
+                TBankCalendarNotificationEvent(
+                    **item.model_dump(),
+                    telegram_user_id=telegram_user_id,
+                    days_before=days_before,
+                    notified_at_msk=notified_at_msk.isoformat(timespec="seconds"),
+                )
+            )
+        return notifications
+
+    async def _load_instrument_events(
+        self,
+        *,
+        instrument: Any,
+        today_msk: date,
+        from_utc: datetime,
+        to_utc: datetime,
+    ) -> list[TBankCalendarEventItem]:
+        instrument_type = str(getattr(instrument, "instrument_type", "") or "").lower()
+        figi = str(getattr(instrument, "figi", "") or "").strip()
+        if not figi:
+            return []
+        events: list[TBankCalendarEventItem] = []
+
+        if instrument_type in {"share", "etf"}:
+            for raw_item in await self.connector.get_dividends(figi=figi, from_date=from_utc, to_date=to_utc):
+                event = self._dividend_event(instrument, raw_item, today_msk)
+                if event is not None:
+                    events.append(event)
+
+        if instrument_type == "bond":
+            for raw_item in await self.connector.get_bond_coupons(figi=figi, from_date=from_utc, to_date=to_utc):
+                event = self._coupon_event(instrument, raw_item, today_msk)
+                if event is not None:
+                    events.append(event)
+            for raw_item in await self.connector.get_bond_events(figi=figi, from_date=from_utc, to_date=to_utc):
+                event = self._bond_event(instrument, raw_item, today_msk)
+                if event is not None:
+                    events.append(event)
+
+        return events
+
+    def _dividend_event(self, instrument: Any, raw_item: dict[str, Any], today_msk: date) -> TBankCalendarEventItem | None:
+        event_date = self._parse_date(raw_item.get("paymentDate") or raw_item.get("recordDate") or raw_item.get("lastBuyDate"))
+        if event_date is None:
+            return None
+        amount, currency = self._money_payload(raw_item.get("dividendNet"))
+        details = []
+        last_buy = self._date_text(raw_item.get("lastBuyDate"))
+        record = self._date_text(raw_item.get("recordDate"))
+        if last_buy:
+            details.append(f"последний день покупки: {last_buy}")
+        if record:
+            details.append(f"дата фиксации: {record}")
+        return self._event_item(
+            instrument=instrument,
+            event_type="dividend",
+            event_date=event_date,
+            today_msk=today_msk,
+            amount=amount,
+            currency=currency,
+            yield_percent=self._quotation_text(raw_item.get("yieldValue")),
+            description=", ".join(details) or None,
+        )
+
+    def _coupon_event(self, instrument: Any, raw_item: dict[str, Any], today_msk: date) -> TBankCalendarEventItem | None:
+        event_date = self._parse_date(raw_item.get("couponDate"))
+        if event_date is None:
+            return None
+        amount, currency = self._money_payload(raw_item.get("payOneBond"))
+        coupon_number = raw_item.get("couponNumber")
+        description = f"купон #{coupon_number}" if coupon_number is not None else None
+        return self._event_item(
+            instrument=instrument,
+            event_type="coupon",
+            event_date=event_date,
+            today_msk=today_msk,
+            amount=amount,
+            currency=currency,
+            description=description,
+        )
+
+    def _bond_event(self, instrument: Any, raw_item: dict[str, Any], today_msk: date) -> TBankCalendarEventItem | None:
+        raw_type = str(raw_item.get("eventType") or raw_item.get("type") or "").upper()
+        if "CPN" in raw_type or "COUPON" in raw_type:
+            return None
+        event_date = self._parse_date(raw_item.get("eventDate") or raw_item.get("date"))
+        if event_date is None:
+            return None
+        event_type = "bond_event"
+        if "MATURITY" in raw_type or "MTY" in raw_type:
+            event_type = "maturity"
+        elif "OFFER" in raw_type or "PUT" in raw_type or "CALL" in raw_type:
+            event_type = "offer"
+        elif "CONV" in raw_type:
+            event_type = "conversion"
+        return self._event_item(
+            instrument=instrument,
+            event_type=event_type,
+            event_date=event_date,
+            today_msk=today_msk,
+            description=raw_type or None,
+        )
+
+    def _event_item(
+        self,
+        *,
+        instrument: Any,
+        event_type: str,
+        event_date: date,
+        today_msk: date,
+        amount: str | None = None,
+        currency: str | None = None,
+        yield_percent: str | None = None,
+        description: str | None = None,
+    ) -> TBankCalendarEventItem:
+        figi = str(getattr(instrument, "figi", "") or "")
+        event_date_text = event_date.isoformat()
+        return TBankCalendarEventItem(
+            event_id=f"{figi}:{event_type}:{event_date_text}",
+            event_type=event_type,
+            event_type_label=self._EVENT_LABELS.get(event_type, event_type),
+            event_date=event_date_text,
+            days_left=(event_date - today_msk).days,
+            figi=figi,
+            ticker=getattr(instrument, "ticker", None),
+            instrument_name=getattr(instrument, "instrument_name", None),
+            instrument_type=getattr(instrument, "instrument_type", None),
+            amount=amount,
+            currency=currency,
+            yield_percent=yield_percent,
+            description=description or None,
+        )
+
+    @staticmethod
+    def _settings_response(row: Any) -> TBankCalendarNotificationSettingsResponse:
+        return TBankCalendarNotificationSettingsResponse(
+            telegram_user_id=int(row.telegram_user_id),
+            enabled=bool(row.enabled),
+            days_before=int(row.days_before),
+        )
+
+    @classmethod
+    def _money_payload(cls, raw_value: object) -> tuple[str | None, str | None]:
+        if not isinstance(raw_value, dict):
+            return None, None
+        value = cls._quotation_text(raw_value)
+        currency = str(raw_value.get("currency") or "").strip().upper() or None
+        return value, currency
+
+    @classmethod
+    def _quotation_text(cls, raw_value: object) -> str | None:
+        if not isinstance(raw_value, dict):
+            return None
+        try:
+            units = int(raw_value.get("units", 0))
+            nano = int(raw_value.get("nano", 0))
+        except Exception:
+            return None
+        value = Decimal(units) + (Decimal(nano) / Decimal(1_000_000_000))
+        text = format(value.normalize(), "f")
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
+
+    @classmethod
+    def _date_text(cls, raw_value: object) -> str | None:
+        parsed = cls._parse_date(raw_value)
+        return parsed.isoformat() if parsed is not None else None
+
+    @staticmethod
+    def _parse_date(raw_value: object) -> date | None:
+        if isinstance(raw_value, date):
+            return raw_value
+        if not isinstance(raw_value, str):
+            return None
+        value = raw_value.strip()
+        if not value:
+            return None
+        if value.endswith("Z"):
+            value = f"{value[:-1]}+00:00"
+        try:
+            return datetime.fromisoformat(value).date()
+        except ValueError:
+            try:
+                return date.fromisoformat(value[:10])
+            except ValueError:
+                return None
 
 
 class TBankMonitorService:

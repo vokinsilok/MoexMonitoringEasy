@@ -56,6 +56,7 @@ BACKGROUND_TASKS: set[asyncio.Task] = set()
 MENU_SHARES = "📊 Инструменты"
 MENU_NEW_MONITOR = "🔔 Новый мониторинг"
 MENU_MONITORS = "🧭 Мои мониторинги"
+MENU_CALENDAR = "🗓 Календарь"
 MENU_PORTFOLIO = "💼 Портфель"
 MENU_PORTFOLIO_ANALYSIS = "🤖 Анализ портфеля"
 MENU_OPERATIONS = "🕘 Операции"
@@ -83,8 +84,9 @@ MONITOR_INTERVAL_PRESETS_SECONDS: tuple[int, ...] = (15, 30, 60, 120, 300, 600)
 MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=MENU_SHARES), KeyboardButton(text=MENU_NEW_MONITOR)],
-        [KeyboardButton(text=MENU_MONITORS), KeyboardButton(text=MENU_PORTFOLIO)],
-        [KeyboardButton(text=MENU_PORTFOLIO_ANALYSIS), KeyboardButton(text=MENU_OPERATIONS)],
+        [KeyboardButton(text=MENU_MONITORS), KeyboardButton(text=MENU_CALENDAR)],
+        [KeyboardButton(text=MENU_PORTFOLIO), KeyboardButton(text=MENU_PORTFOLIO_ANALYSIS)],
+        [KeyboardButton(text=MENU_OPERATIONS)],
         [KeyboardButton(text=MENU_PROFILE)],
         [KeyboardButton(text=MENU_ORDER), KeyboardButton(text=MENU_STOP)],
         [KeyboardButton(text=MENU_ACTIVE_ORDERS)],
@@ -95,8 +97,9 @@ MAIN_MENU_KEYBOARD = ReplyKeyboardMarkup(
 MAIN_MENU_KEYBOARD_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=MENU_SHARES), KeyboardButton(text=MENU_NEW_MONITOR)],
-        [KeyboardButton(text=MENU_MONITORS), KeyboardButton(text=MENU_PORTFOLIO)],
-        [KeyboardButton(text=MENU_PORTFOLIO_ANALYSIS), KeyboardButton(text=MENU_OPERATIONS)],
+        [KeyboardButton(text=MENU_MONITORS), KeyboardButton(text=MENU_CALENDAR)],
+        [KeyboardButton(text=MENU_PORTFOLIO), KeyboardButton(text=MENU_PORTFOLIO_ANALYSIS)],
+        [KeyboardButton(text=MENU_OPERATIONS)],
         [KeyboardButton(text=MENU_PROFILE)],
         [KeyboardButton(text=MENU_ORDER), KeyboardButton(text=MENU_STOP)],
         [KeyboardButton(text=MENU_ACTIVE_ORDERS), KeyboardButton(text=MENU_ADMIN)],
@@ -115,6 +118,10 @@ MON_CB_EDIT_PREFIX = "mon:edit"
 MON_CB_EDIT_PERCENT_PREFIX = "mon:edit_pct"
 MON_CB_EDIT_RUB_PREFIX = "mon:edit_rub"
 MON_CB_EDIT_BACK_PREFIX = "mon:edit_back"
+CAL_CB_REFRESH = "cal:refresh"
+CAL_CB_SETTINGS = "cal:settings"
+CAL_CB_TOGGLE = "cal:toggle"
+CAL_CB_DAYS_PREFIX = "cal:days"
 PROF_CB_UPDATE = "prof:update"
 PROF_CB_CHECK = "prof:check"
 AO_CB_REFRESH = "ao:refresh"
@@ -434,6 +441,134 @@ async def _send_portfolio_analysis_document(
             path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def _calendar_keyboard(settings_payload: dict | None = None) -> InlineKeyboardMarkup:
+    enabled = bool((settings_payload or {}).get("enabled", True))
+    toggle_text = "Выключить уведомления" if enabled else "Включить уведомления"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Обновить", callback_data=CAL_CB_REFRESH),
+                InlineKeyboardButton(text="Настройки", callback_data=CAL_CB_SETTINGS),
+            ],
+            [InlineKeyboardButton(text=toggle_text, callback_data=CAL_CB_TOGGLE)],
+        ]
+    )
+
+
+def _calendar_settings_keyboard(settings_payload: dict) -> InlineKeyboardMarkup:
+    current_days = _safe_int(settings_payload.get("days_before")) or 3
+    enabled = bool(settings_payload.get("enabled", True))
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=("✓ " if current_days == value else "") + f"{value} дн.",
+                callback_data=f"{CAL_CB_DAYS_PREFIX}:{value}",
+            )
+            for value in (1, 3, 7)
+        ],
+        [
+            InlineKeyboardButton(
+                text=("✓ " if current_days == value else "") + f"{value} дн.",
+                callback_data=f"{CAL_CB_DAYS_PREFIX}:{value}",
+            )
+            for value in (14, 30)
+        ],
+        [InlineKeyboardButton(text="Выключить" if enabled else "Включить", callback_data=CAL_CB_TOGGLE)],
+        [InlineKeyboardButton(text="Назад к календарю", callback_data=CAL_CB_REFRESH)],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _render_calendar_text(payload: dict, settings_payload: dict | None = None) -> str:
+    items = payload.get("items") if isinstance(payload, dict) else []
+    items = items if isinstance(items, list) else []
+    settings_payload = settings_payload or {}
+    enabled = bool(settings_payload.get("enabled", True))
+    days_before = _safe_int(settings_payload.get("days_before")) or 3
+    lines = [
+        "🗓 <b>Календарь избранного</b>",
+        f"Уведомления: <b>{'включены' if enabled else 'выключены'}</b>, за <b>{days_before} дн.</b>",
+        "",
+    ]
+    if not items:
+        lines.append("Событий по избранным инструментам пока не найдено.")
+        lines.append("Добавьте акции, облигации или фонды в избранное, чтобы отслеживать выплаты.")
+        return "\n".join(lines)
+
+    for raw_item in items[:15]:
+        if not isinstance(raw_item, dict):
+            continue
+        ticker = html.escape(str(raw_item.get("ticker") or raw_item.get("figi") or "—"))
+        event_type = html.escape(str(raw_item.get("event_type_label") or raw_item.get("event_type") or "Событие"))
+        event_date = html.escape(str(raw_item.get("event_date") or "—"))
+        days_left = _safe_int(raw_item.get("days_left"))
+        days_text = f"через {days_left} дн." if days_left is not None and days_left >= 0 else "дата прошла"
+        amount = raw_item.get("amount")
+        currency = raw_item.get("currency")
+        amount_text = f" · {html.escape(str(amount))} {html.escape(str(currency or ''))}" if amount else ""
+        description = raw_item.get("description")
+        description_text = f"\n   {html.escape(str(description))}" if description else ""
+        lines.append(
+            f"• <b>{event_date}</b> · {event_type} · <b>{ticker}</b> ({days_text}){amount_text}{description_text}"
+        )
+
+    total = _safe_int(payload.get("total")) or len(items)
+    if total > 15:
+        lines.append(f"\nПоказаны ближайшие 15 из {total}.")
+    errors = payload.get("errors")
+    if isinstance(errors, list) and errors:
+        lines.append(f"\nНе удалось загрузить часть событий: {len(errors)}.")
+    return "\n".join(lines)
+
+
+async def _send_calendar_message(message: Message) -> None:
+    if not message.from_user:
+        return
+    try:
+        settings_payload = await service.get_calendar_settings(message.from_user.id)
+        payload = await service.get_calendar(message.from_user.id, days_ahead=180)
+    except RuntimeError as exc:
+        await _safe_telegram_call(message.answer(f"Не удалось загрузить календарь: {html.escape(str(exc))}"))
+        return
+    await _safe_telegram_call(
+        message.answer(
+            _render_calendar_text(payload, settings_payload),
+            reply_markup=_calendar_keyboard(settings_payload),
+        )
+    )
+
+
+async def _edit_calendar_message(callback: CallbackQuery) -> None:
+    try:
+        settings_payload = await service.get_calendar_settings(callback.from_user.id)
+        payload = await service.get_calendar(callback.from_user.id, days_ahead=180)
+    except RuntimeError as exc:
+        await callback.answer(f"Не удалось загрузить календарь: {exc}", show_alert=True)
+        return
+    if callback.message:
+        await _safe_edit_text(
+            callback.message,
+            _render_calendar_text(payload, settings_payload),
+            reply_markup=_calendar_keyboard(settings_payload),
+        )
+
+
+async def _edit_calendar_settings(callback: CallbackQuery) -> None:
+    try:
+        settings_payload = await service.get_calendar_settings(callback.from_user.id)
+    except RuntimeError as exc:
+        await callback.answer(f"Не удалось загрузить настройки: {exc}", show_alert=True)
+        return
+    text = (
+        "🔔 <b>Уведомления календаря</b>\n"
+        f"Статус: <b>{'включены' if settings_payload.get('enabled') else 'выключены'}</b>\n"
+        f"Напоминать за: <b>{settings_payload.get('days_before')} дн.</b>\n\n"
+        "Уведомления отправляются по событиям из избранного: дивиденды, купоны и события облигаций."
+    )
+    if callback.message:
+        await _safe_edit_text(callback.message, text, reply_markup=_calendar_settings_keyboard(settings_payload))
 
 
 async def _notify_admins_access_request(message: Message, access_item: dict) -> None:
@@ -875,6 +1010,7 @@ MAIN_MENU_TEXTS = {
     MENU_SHARES,
     MENU_NEW_MONITOR,
     MENU_MONITORS,
+    MENU_CALENDAR,
     MENU_PORTFOLIO,
     MENU_PORTFOLIO_ANALYSIS,
     MENU_OPERATIONS,
@@ -2153,6 +2289,82 @@ async def monitor_edit_set_rub(message: Message, state: FSMContext) -> None:
     await _apply_monitor_edit_value(message, state, "rub")
 
 
+@router.message(Command("calendar"))
+@router.message(F.text == MENU_CALENDAR)
+async def calendar_start(message: Message) -> None:
+    if not message.from_user:
+        return
+    await _send_calendar_message(message)
+
+
+@router.callback_query(F.data == CAL_CB_REFRESH)
+async def calendar_refresh_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer("Обновляю календарь..."))
+    await _edit_calendar_message(callback)
+
+
+@router.callback_query(F.data == CAL_CB_SETTINGS)
+async def calendar_settings_callback(callback: CallbackQuery) -> None:
+    await _safe_telegram_call(callback.answer())
+    await _edit_calendar_settings(callback)
+
+
+@router.callback_query(F.data == CAL_CB_TOGGLE)
+async def calendar_toggle_callback(callback: CallbackQuery) -> None:
+    try:
+        settings_payload = await service.get_calendar_settings(callback.from_user.id)
+        updated = await service.update_calendar_settings(
+            callback.from_user.id,
+            enabled=not bool(settings_payload.get("enabled", True)),
+            days_before=_safe_int(settings_payload.get("days_before")) or 3,
+        )
+    except RuntimeError as exc:
+        await callback.answer(f"Не удалось обновить настройки: {exc}", show_alert=True)
+        return
+    await _safe_telegram_call(callback.answer("Настройки обновлены"))
+    if callback.message:
+        await _safe_edit_text(
+            callback.message,
+            (
+                "🔔 <b>Уведомления календаря</b>\n"
+                f"Статус: <b>{'включены' if updated.get('enabled') else 'выключены'}</b>\n"
+                f"Напоминать за: <b>{updated.get('days_before')} дн.</b>"
+            ),
+            reply_markup=_calendar_settings_keyboard(updated),
+        )
+
+
+@router.callback_query(F.data.startswith(f"{CAL_CB_DAYS_PREFIX}:"))
+async def calendar_days_callback(callback: CallbackQuery) -> None:
+    raw_days = str(callback.data or "").rsplit(":", maxsplit=1)[-1]
+    if not raw_days.isdigit():
+        await callback.answer("Некорректное значение", show_alert=True)
+        return
+    days_before = int(raw_days)
+    try:
+        settings_payload = await service.get_calendar_settings(callback.from_user.id)
+        updated = await service.update_calendar_settings(
+            callback.from_user.id,
+            enabled=bool(settings_payload.get("enabled", True)),
+            days_before=days_before,
+        )
+    except RuntimeError as exc:
+        await callback.answer(f"Не удалось обновить настройки: {exc}", show_alert=True)
+        return
+    await _safe_telegram_call(callback.answer(f"Буду напоминать за {days_before} дн."))
+    if callback.message:
+        await _safe_edit_text(
+            callback.message,
+            (
+                "🔔 <b>Уведомления календаря</b>\n"
+                f"Статус: <b>{'включены' if updated.get('enabled') else 'выключены'}</b>\n"
+                f"Напоминать за: <b>{updated.get('days_before')} дн.</b>\n\n"
+                "Уведомления отправляются по событиям из избранного."
+            ),
+            reply_markup=_calendar_settings_keyboard(updated),
+        )
+
+
 @router.message(F.text == MENU_PORTFOLIO)
 async def show_portfolio(message: Message) -> None:
     if not message.from_user:
@@ -3006,6 +3218,9 @@ async def _open_menu_section(message: Message, state: FSMContext, text: str) -> 
         return
     if _menu_text_equals(normalized_text, MENU_MONITORS):
         await list_monitors(message)
+        return
+    if _menu_text_equals(normalized_text, MENU_CALENDAR):
+        await calendar_start(message)
         return
     if _menu_text_equals(normalized_text, MENU_PORTFOLIO):
         await show_portfolio(message)

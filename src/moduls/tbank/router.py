@@ -13,6 +13,10 @@ from src.moduls.tbank.schemas import (
     TBankBotAccessListResponse,
     TBankBotAccessRequest,
     TBankBotAccessStatusResponse,
+    TBankCalendarNotificationCheckResponse,
+    TBankCalendarNotificationSettingsRequest,
+    TBankCalendarNotificationSettingsResponse,
+    TBankCalendarResponse,
     TBankFavoriteShareRequest,
     TBankFavoriteSharesResponse,
     TBankMonitorCheckResponse,
@@ -41,6 +45,7 @@ from src.moduls.tbank.schemas import (
 )
 from src.moduls.tbank.service import (
     ALLOWED_SECTORS,
+    TBankCalendarService,
     TBankMonitorService,
     TBankPortfolioAnalysisService,
     TBankSharesService,
@@ -643,6 +648,63 @@ async def remove_favorite(payload: TBankFavoriteShareRequest, db: AtomicDBDep) -
         figi=payload.figi,
     )
     return TBankTradingActionResponse(ok=True, details={"figi": payload.figi, "favorite": False, "removed": removed})
+
+
+@tbank_router.get(
+    "/calendar",
+    response_model=TBankCalendarResponse,
+    summary="Календарь выплат и событий по избранным инструментам",
+)
+async def get_calendar(
+    db: DBDep,
+    telegram_user_id: int = Query(..., ge=1),
+    days_ahead: int = Query(default=180, ge=1, le=730),
+) -> TBankCalendarResponse:
+    service = TBankCalendarService(db=db, connector=_build_global_connector())
+    return await service.list_calendar(telegram_user_id=telegram_user_id, days_ahead=days_ahead)
+
+
+@tbank_router.get(
+    "/calendar/settings",
+    response_model=TBankCalendarNotificationSettingsResponse,
+    summary="Настройки календарных уведомлений",
+)
+async def get_calendar_settings(
+    db: AtomicDBDep,
+    telegram_user_id: int = Query(..., ge=1),
+) -> TBankCalendarNotificationSettingsResponse:
+    service = TBankCalendarService(db=db, connector=_build_global_connector())
+    return await service.get_notification_settings(telegram_user_id)
+
+
+@tbank_router.post(
+    "/calendar/settings",
+    response_model=TBankCalendarNotificationSettingsResponse,
+    summary="Обновить настройки календарных уведомлений",
+)
+async def update_calendar_settings(
+    payload: TBankCalendarNotificationSettingsRequest,
+    db: AtomicDBDep,
+) -> TBankCalendarNotificationSettingsResponse:
+    service = TBankCalendarService(db=db, connector=_build_global_connector())
+    return await service.update_notification_settings(
+        telegram_user_id=payload.telegram_user_id,
+        enabled=payload.enabled,
+        days_before=payload.days_before,
+    )
+
+
+@tbank_router.post(
+    "/calendar/notifications/check",
+    response_model=TBankCalendarNotificationCheckResponse,
+    summary="Проверить календарные уведомления пользователя",
+)
+async def check_calendar_notifications(
+    payload: TBankPortfolioRequest,
+    db: AtomicDBDep,
+) -> TBankCalendarNotificationCheckResponse:
+    service = TBankCalendarService(db=db, connector=_build_global_connector())
+    return await service.check_notifications(telegram_user_id=payload.telegram_user_id)
 
 
 @tbank_router.get(
