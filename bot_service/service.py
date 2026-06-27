@@ -10,6 +10,7 @@ class TelegramSharesBrowserService:
     def __init__(self) -> None:
         self._base_url = settings.BACKEND_API_BASE_URL.rstrip("/")
         self._timeout_seconds = max(3, settings.BACKEND_API_TIMEOUT_SECONDS)
+        self._ai_timeout_seconds = max(self._timeout_seconds, settings.BACKEND_AI_TIMEOUT_SECONDS)
 
     async def get_shares_page(
         self,
@@ -75,23 +76,12 @@ class TelegramSharesBrowserService:
         try:
             async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
                 response = await client.get(url, params=params)
+        except httpx.TimeoutException as exc:
+            raise RuntimeError("Запрос занял больше времени, чем ожидалось") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"Не удалось обратиться к backend API: {exc}") from exc
+            raise RuntimeError("Backend временно недоступен") from exc
 
-        if response.status_code != 200:
-            detail = response.text.strip()
-            raise RuntimeError(
-                f"Backend API вернул статус {response.status_code}: {detail or 'без деталей'}"
-            )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError("Backend API вернул невалидный JSON") from exc
-
-        if not isinstance(payload, dict):
-            raise RuntimeError("Некорректный ответ backend API")
-        return payload
+        return self._handle_response(response)
 
     async def get_sectors(self) -> list[str]:
         payload = await self._get_payload("/api/v1/tbank/sectors")
@@ -335,6 +325,7 @@ class TelegramSharesBrowserService:
         return await self._post_payload(
             "/api/v1/tbank/portfolio/analyze",
             {"telegram_user_id": telegram_user_id, "horizon": horizon},
+            timeout_seconds=self._ai_timeout_seconds,
         )
 
     async def get_operations(self, telegram_user_id: int, days: int = 30) -> dict:
@@ -417,26 +408,35 @@ class TelegramSharesBrowserService:
         try:
             async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
                 response = await client.get(url)
+        except httpx.TimeoutException as exc:
+            raise RuntimeError("Запрос занял больше времени, чем ожидалось") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"Не удалось обратиться к backend API: {exc}") from exc
+            raise RuntimeError("Backend временно недоступен") from exc
         return self._handle_response(response)
 
-    async def _post_payload(self, path: str, payload: dict) -> dict:
+    async def _post_payload(self, path: str, payload: dict, timeout_seconds: int | None = None) -> dict:
         url = f"{self._base_url}{path}"
+        timeout = timeout_seconds or self._timeout_seconds
         try:
-            async with httpx.AsyncClient(timeout=self._timeout_seconds) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(url, json=payload)
+        except httpx.TimeoutException as exc:
+            raise RuntimeError("Запрос занял больше времени, чем ожидалось") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError(f"Не удалось обратиться к backend API: {exc}") from exc
+            raise RuntimeError("Backend временно недоступен") from exc
         return self._handle_response(response)
 
     @staticmethod
     def _handle_response(response: httpx.Response) -> dict:
         if response.status_code >= 400:
             detail = response.text.strip()
-            raise RuntimeError(
-                f"Backend API вернул статус {response.status_code}: {detail or 'без деталей'}"
-            )
+            try:
+                payload = response.json()
+                if isinstance(payload, dict) and payload.get("detail"):
+                    detail = str(payload.get("detail"))
+            except ValueError:
+                pass
+            raise RuntimeError(detail or f"Backend вернул ошибку {response.status_code}")
         try:
             payload = response.json()
         except ValueError as exc:

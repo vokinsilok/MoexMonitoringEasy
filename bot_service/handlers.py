@@ -317,6 +317,16 @@ def _portfolio_analysis_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _analysis_horizon_label(horizon: str | None) -> str:
+    mapping = {
+        "1d": "1 день",
+        "7d": "7 дней",
+        "1m": "1 месяц",
+        "1y": "1 год",
+    }
+    return mapping.get(str(horizon or "").strip().lower(), "выбранный срок")
+
+
 async def _notify_admins_access_request(message: Message, access_item: dict) -> None:
     if not message.from_user:
         return
@@ -392,6 +402,45 @@ def _order_submit_error_text(exc: RuntimeError) -> str:
             "Флаг confirm_margin_trade уже включён, повторите попытку через несколько секунд."
         )
     return f"Не удалось разместить заявку: {exc}"
+
+
+def _portfolio_analysis_error_text(exc: RuntimeError) -> str:
+    details = str(exc).strip()
+    lowered = details.lower()
+    if "unsupported analysis horizon" in lowered:
+        return (
+            "Не распознал срок прогноза.\n\n"
+            "Откройте «🤖 Анализ портфеля» заново и выберите срок кнопкой."
+        )
+    if "insufficient balance" in lowered or "402" in lowered:
+        return (
+            "AI-сервис сейчас не может сформировать отчет: на балансе ProxyAPI недостаточно средств.\n\n"
+            "Пополните баланс и повторите анализ."
+        )
+    if "api key" in lowered or "ключ" in lowered:
+        return (
+            "AI-анализ пока не настроен: сервер не видит ключ ProxyAPI.\n\n"
+            "Проверьте переменную <code>AI_API_KEY</code> на сервере."
+        )
+    if "больше времени" in lowered or "timeout" in lowered or "timed out" in lowered:
+        return (
+            "AI-анализ не успел завершиться за отведенное время.\n\n"
+            "Попробуйте еще раз через минуту. Если повторится, уменьшим размер отчета или переключим модель."
+        )
+    if "t-bank" in lowered or "tbank" in lowered:
+        return (
+            "Не удалось получить данные портфеля из T-Bank.\n\n"
+            "Проверьте профиль T-Bank и повторите попытку."
+        )
+    if "backend временно недоступен" in lowered:
+        return (
+            "Сервер бота сейчас не ответил на запрос анализа.\n\n"
+            "Попробуйте еще раз через минуту."
+        )
+    return (
+        "Не получилось сформировать AI-отчет.\n\n"
+        "Попробуйте еще раз через минуту. Если ошибка повторится, я проверю логи сервера."
+    )
 
 
 def _shares_filter_items(
@@ -958,11 +1007,11 @@ async def _emit_monitor_events(message: Message) -> None:
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="Delete",
+                            text="Удалить",
                             callback_data=f"{MON_CB_DEL_PREFIX}:{monitor_id}",
                         ),
                         InlineKeyboardButton(
-                            text="Rebase",
+                            text="Обновить базу",
                             callback_data=f"{MON_CB_REBASE_PREFIX}:{monitor_id}",
                         ),
                     ]
@@ -970,12 +1019,16 @@ async def _emit_monitor_events(message: Message) -> None:
             )
         await _safe_telegram_call(
             message.answer(
-                " <b> </b>\n"
-                f"Монитор: <b>#{event.get('monitor_id')}</b>\n"
-                f"Инструмент: <b>{event.get('ticker') or event.get('figi')}</b>\n"
-                f"Цена: <b>{event.get('current_price')}</b>\n"
-                f"Изменение: <b>{event.get('change_percent')}%</b> / <b>{event.get('change_rub')}</b>\n"
-                f"Порог: <b>{event.get('threshold_percent')}%</b> или <b>{event.get('threshold_rub')}</b>",
+                "🔔 <b>Сработал мониторинг цены</b>\n"
+                f"Инструмент: <b>{html.escape(str(event.get('ticker') or event.get('figi') or '—'))}</b>\n"
+                f"Монитор: <b>#{event.get('monitor_id')}</b>\n\n"
+                f"Текущая цена: <b>{_to_clean_num_str(event.get('current_price'))} RUB</b>\n"
+                f"Базовая цена: <b>{_to_clean_num_str(event.get('base_price'))} RUB</b>\n"
+                f"Изменение: <b>{_to_clean_num_str(event.get('change_percent'), '%')}</b> / "
+                f"<b>{_to_clean_num_str(event.get('change_rub'))} RUB</b>\n"
+                f"Порог: <b>{_to_clean_num_str(event.get('threshold_percent'), '%')}</b> или "
+                f"<b>{_to_clean_num_str(event.get('threshold_rub'))} RUB</b>\n"
+                f"Время МСК: <b>{_format_datetime(str(event.get('triggered_at_msk') or ''))}</b>",
                 reply_markup=keyboard,
             )
         )
@@ -2010,7 +2063,7 @@ async def portfolio_analysis_start(message: Message) -> None:
     await _safe_telegram_call(
         message.answer(
             "🤖 <b>Анализ портфеля</b>\n"
-            "Выберите срок прогноза. Бот соберет текущий портфель T-Bank и отправит его AI-аналитику.",
+            "Выберите горизонт прогноза. Я соберу текущий портфель T-Bank и подготовлю AI-отчет.",
             reply_markup=_portfolio_analysis_keyboard(),
         )
     )
@@ -2022,19 +2075,22 @@ async def portfolio_analysis_callback(callback: CallbackQuery) -> None:
         return
     horizon = str(callback.data or "").rsplit(":", maxsplit=1)[-1]
     await _safe_telegram_call(callback.answer("Готовлю анализ..."))
+    horizon_label = _analysis_horizon_label(horizon)
     await _safe_telegram_call(
         callback.message.answer(
-            "Собираю портфель и формирую AI-отчет. Обычно это занимает до минуты."
+            "🤖 <b>Запустил анализ портфеля</b>\n"
+            f"Горизонт: <b>{html.escape(horizon_label)}</b>\n\n"
+            "Собираю позиции, структуру и доходность. Обычно отчет готов за 20–60 секунд."
         )
     )
     try:
         payload = await service.analyze_portfolio(callback.from_user.id, horizon=horizon)
     except RuntimeError as exc:
-        await _safe_telegram_call(callback.message.answer(f"Не удалось выполнить анализ портфеля: {exc}"))
+        await _safe_telegram_call(callback.message.answer(_portfolio_analysis_error_text(exc)))
         return
 
     report = str(payload.get("report") or "").strip()
-    horizon_label = str(payload.get("horizon_label") or horizon)
+    horizon_label = str(payload.get("horizon_label") or horizon_label)
     generated_at = _format_datetime(str(payload.get("generated_at_msk") or ""))
     model = str(payload.get("model") or "AI")
     if not report:
