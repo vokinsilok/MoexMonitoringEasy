@@ -988,6 +988,14 @@ class TBankPortfolioAnalysisService:
             plugins=self.web_plugins,
             web_search_options=self.web_search_options,
         )
+        if self._looks_incomplete_report(report):
+            report = await self.ai_connector.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": self._repair_system_prompt()},
+                    {"role": "user", "content": self._repair_user_prompt(payload, report)},
+                ],
+                reasoning={"effort": "low"},
+            )
         return TBankPortfolioAnalysisResponse(
             horizon=normalized_horizon,
             horizon_label=horizon_label,
@@ -1044,15 +1052,19 @@ class TBankPortfolioAnalysisService:
             "источника, даты, инструмента и механизма влияния. "
             "Если используешь внешний факт, укажи источник коротко в скобках. Не выдумывай цены, новости и события. "
             "Не давай прямых команд купить/продать и не обещай доходность. Пиши по-русски, четко и по делу. "
+            "Не используй англоязычный жаргон вроде risk-off/risk-on; заменяй на простой русский вывод. "
+            "Предпочитай надежные источники: ЦБ РФ, Мосбиржа, раскрытия эмитентов, T-Invest, РБК, Интерфакс, "
+            "Коммерсантъ, Ведомости, Cbonds, БКС/СберCIB/ВТБ аналитику. Слабые агрегаторы используй только если "
+            "нет нормального источника, и не строй на них главный вывод. "
             "Структура ответа строго такая: "
-            "ИТОГ: направление портфеля на горизонт — позитивно/нейтрально/негативно; 2-3 причины по весам. "
-            "ФАКТОРЫ: 3-5 пунктов, только факты внутри горизонта или уже действующий фон; у каждого пункта укажи влияние. "
-            "ПО ПОЗИЦИЯМ: только позиции с существенным весом, в порядке portfolio_rank; формат 'тикер, вес — вывод'. "
-            "СЦЕНАРИЙ: базовый/позитивный/негативный на выбранный горизонт, без фантазий и без точных обещаний доходности. "
-            "РИСКИ И ТРИГГЕРЫ: конкретные уровни/даты/публикации/события, которые надо отслеживать дальше. "
+            "ИТОГ: ровно 3 коротких предложения. "
+            "ФАКТОРЫ: ровно 4 пункта; только факты внутри горизонта или уже действующий фон; у каждого пункта укажи влияние. "
+            "ПО ПОЗИЦИЯМ: максимум 5 позиций с существенным весом, в порядке portfolio_rank; формат 'тикер, вес — вывод'. "
+            "СЦЕНАРИЙ: ровно 3 короткие строки: базовый, позитивный, негативный. Каждая строка должна быть законченной. "
+            "РИСКИ И ТРИГГЕРЫ: максимум 4 конкретных пункта. "
             "В конце одна строка: 'Не является индивидуальной инвестиционной рекомендацией.' "
             "Если после web search нет релевантных фактов по горизонту, прямо напиши 'релевантных свежих факторов не найдено' "
-            "и не заменяй это общими словами. Объем — до 3800 знаков."
+            "и не заменяй это общими словами. Объем — 2600-3200 знаков. Лучше короче, но обязательно завершенный отчет."
         )
 
     @staticmethod
@@ -1066,6 +1078,45 @@ class TBankPortfolioAnalysisService:
             "Сначала проверь, попадает ли найденное событие в analysis_window_msk; если нет — не делай его главным выводом.\n\n"
             f"Данные портфеля:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
         )
+
+    @classmethod
+    def _repair_system_prompt(cls) -> str:
+        return (
+            "Ты редактор инвестиционного отчета. Тебе дадут JSON портфеля и черновик отчета, который мог оборваться. "
+            "Не делай новый web search. Сохрани смысл, убери воду, исправь незавершенные предложения и верни полностью "
+            "законченный отчет на русском. Структура: ИТОГ, ФАКТОРЫ, ПО ПОЗИЦИЯМ, СЦЕНАРИЙ, РИСКИ И ТРИГГЕРЫ, "
+            "дисклеймер. Объем до 2800 знаков. Никаких оборванных строк."
+        )
+
+    @staticmethod
+    def _repair_user_prompt(payload: dict[str, Any], draft: str) -> str:
+        return (
+            "Проверь и перепиши отчет так, чтобы он был завершенным и коротким.\n\n"
+            f"Данные портфеля:\n{json.dumps(payload, ensure_ascii=False)}\n\n"
+            f"Черновик отчета:\n{draft}"
+        )
+
+    @classmethod
+    def _looks_incomplete_report(cls, report: str) -> bool:
+        text = str(report or "").strip()
+        if not text:
+            return True
+        if "Не является индивидуальной инвестиционной рекомендацией" not in text:
+            return True
+        last_meaningful_line = next(
+            (line.strip() for line in reversed(text.splitlines()) if line.strip()),
+            "",
+        )
+        if last_meaningful_line and not last_meaningful_line.endswith((".", "!", "?", "”", "»")):
+            return True
+        incomplete_markers = (
+            "Негативный: пробой",
+            "Позитивный:",
+            "Базовый:",
+            "СЦЕНАРИЙ:",
+        )
+        tail = text[-400:]
+        return any(marker in tail and tail.rstrip().endswith(marker) for marker in incomplete_markers)
 
     @classmethod
     def _normalize_portfolio(cls, raw_portfolio: dict[str, Any]) -> dict[str, Any]:
