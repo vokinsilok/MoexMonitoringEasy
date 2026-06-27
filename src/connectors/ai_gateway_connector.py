@@ -1,3 +1,4 @@
+import asyncio
 from typing import Any
 
 import httpx
@@ -55,23 +56,49 @@ class AIGatewayConnector:
             payload["web_search_options"] = web_search_options
 
         url = f"{self.base_url}/chat/completions"
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    url,
-                    json=payload,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                        "Accept": "application/json",
-                    },
-                )
-        except httpx.TimeoutException as exc:
-            raise AIGatewayRequestError(
-                f"AI gateway request timed out after {self.timeout:.0f} seconds"
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise AIGatewayRequestError(f"Unable to reach AI gateway: {exc}") from exc
+        response: httpx.Response | None = None
+        last_timeout: httpx.TimeoutException | None = None
+        last_http_error: httpx.HTTPError | None = None
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout) as client:
+                    response = await client.post(
+                        url,
+                        json=payload,
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                        },
+                    )
+            except httpx.TimeoutException as exc:
+                last_timeout = exc
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
+                    continue
+                raise AIGatewayRequestError(
+                    f"AI gateway request timed out after {self.timeout:.0f} seconds"
+                ) from exc
+            except httpx.HTTPError as exc:
+                last_http_error = exc
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
+                    continue
+                raise AIGatewayRequestError(f"Unable to reach AI gateway: {exc}") from exc
+
+            if response.status_code < 400 or not self._is_retryable_gateway_status(response.status_code):
+                break
+            if attempt == 0:
+                await asyncio.sleep(1.5)
+
+        if response is None:
+            if last_timeout is not None:
+                raise AIGatewayRequestError(
+                    f"AI gateway request timed out after {self.timeout:.0f} seconds"
+                ) from last_timeout
+            if last_http_error is not None:
+                raise AIGatewayRequestError(f"Unable to reach AI gateway: {last_http_error}") from last_http_error
+            raise AIGatewayRequestError("Unable to reach AI gateway")
 
         if response.status_code >= 400:
             detail = response.text.strip()
@@ -104,6 +131,10 @@ class AIGatewayConnector:
         if not isinstance(content, str) or not content.strip():
             raise AIGatewayRequestError("AI gateway returned empty message content")
         return content.strip()
+
+    @staticmethod
+    def _is_retryable_gateway_status(status_code: int) -> bool:
+        return status_code in {408, 429, 500, 502, 503, 504, 524}
 
     def _should_retry_via_proxyapi_openai(self, status_code: int, detail: str) -> bool:
         if status_code != 403:
