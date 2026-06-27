@@ -56,6 +56,38 @@ class AIGatewayConnector:
             payload["web_search_options"] = web_search_options
 
         url = f"{self.base_url}/chat/completions"
+        empty_content_seen = False
+        for content_attempt in range(2):
+            response = await self._post_chat_completion(url, payload)
+            if response.status_code >= 400:
+                detail = response.text.strip()
+                if self._should_retry_via_proxyapi_openai(response.status_code, detail):
+                    return await self._create_proxyapi_openai_response(
+                        messages=messages,
+                        web_search_enabled=bool(plugins or web_search_options),
+                    )
+                raise AIGatewayRequestError(
+                    f"AI gateway returned HTTP {response.status_code}: {detail or 'empty response'}"
+                )
+
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise AIGatewayRequestError("AI gateway returned non-JSON response") from exc
+
+            content = self._extract_chat_completion_text(data)
+            if content:
+                return content
+
+            empty_content_seen = True
+            if content_attempt == 0:
+                await asyncio.sleep(1.5)
+
+        if empty_content_seen:
+            raise AIGatewayRequestError("AI gateway returned empty message content")
+        raise AIGatewayRequestError("AI gateway returned unexpected response shape")
+
+    async def _post_chat_completion(self, url: str, payload: dict[str, Any]) -> httpx.Response:
         response: httpx.Response | None = None
         last_timeout: httpx.TimeoutException | None = None
         last_http_error: httpx.HTTPError | None = None
@@ -87,50 +119,45 @@ class AIGatewayConnector:
                 raise AIGatewayRequestError(f"Unable to reach AI gateway: {exc}") from exc
 
             if response.status_code < 400 or not self._is_retryable_gateway_status(response.status_code):
-                break
+                return response
             if attempt == 0:
                 await asyncio.sleep(1.5)
 
-        if response is None:
-            if last_timeout is not None:
-                raise AIGatewayRequestError(
-                    f"AI gateway request timed out after {self.timeout:.0f} seconds"
-                ) from last_timeout
-            if last_http_error is not None:
-                raise AIGatewayRequestError(f"Unable to reach AI gateway: {last_http_error}") from last_http_error
-            raise AIGatewayRequestError("Unable to reach AI gateway")
-
-        if response.status_code >= 400:
-            detail = response.text.strip()
-            if self._should_retry_via_proxyapi_openai(response.status_code, detail):
-                return await self._create_proxyapi_openai_response(
-                    messages=messages,
-                    web_search_enabled=bool(plugins or web_search_options),
-                )
+        if response is not None:
+            return response
+        if last_timeout is not None:
             raise AIGatewayRequestError(
-                f"AI gateway returned HTTP {response.status_code}: {detail or 'empty response'}"
-            )
+                f"AI gateway request timed out after {self.timeout:.0f} seconds"
+            ) from last_timeout
+        if last_http_error is not None:
+            raise AIGatewayRequestError(f"Unable to reach AI gateway: {last_http_error}") from last_http_error
+        raise AIGatewayRequestError("Unable to reach AI gateway")
 
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise AIGatewayRequestError("AI gateway returned non-JSON response") from exc
-
+    @staticmethod
+    def _extract_chat_completion_text(data: dict[str, Any]) -> str | None:
         if not isinstance(data, dict):
-            raise AIGatewayRequestError("AI gateway returned unexpected response shape")
+            return None
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices:
-            raise AIGatewayRequestError("AI gateway response does not contain choices")
+            return None
         first_choice = choices[0]
         if not isinstance(first_choice, dict):
-            raise AIGatewayRequestError("AI gateway choice has unexpected shape")
+            return None
         message = first_choice.get("message")
         if not isinstance(message, dict):
-            raise AIGatewayRequestError("AI gateway choice does not contain message")
+            return None
         content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise AIGatewayRequestError("AI gateway returned empty message content")
-        return content.strip()
+        if isinstance(content, str):
+            return content.strip() or None
+        if isinstance(content, list):
+            chunks: list[str] = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        chunks.append(text.strip())
+            return "\n\n".join(chunks).strip() or None
+        return None
 
     @staticmethod
     def _is_retryable_gateway_status(status_code: int) -> bool:
