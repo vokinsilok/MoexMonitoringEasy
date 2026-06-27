@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -938,6 +938,12 @@ class TBankPortfolioAnalysisService:
         "1m": "1 месяц",
         "1y": "1 год",
     }
+    _HORIZON_DAYS: dict[str, int] = {
+        "1d": 1,
+        "7d": 7,
+        "1m": 30,
+        "1y": 365,
+    }
 
     def __init__(
         self,
@@ -960,10 +966,16 @@ class TBankPortfolioAnalysisService:
         generated_at = datetime.now(ZoneInfo("Europe/Moscow")).replace(microsecond=0)
         raw_portfolio = await self.trading_service.get_portfolio()
         normalized_portfolio = self._normalize_portfolio(raw_portfolio)
+        window_end = generated_at + timedelta(days=self._HORIZON_DAYS[normalized_horizon])
         payload = {
             "generated_at_msk": generated_at.isoformat(),
             "horizon": normalized_horizon,
             "horizon_label": horizon_label,
+            "analysis_window_msk": {
+                "from": generated_at.isoformat(),
+                "to": window_end.isoformat(),
+                "rule": "Events outside this window may be mentioned only in risks/triggers, not in the verdict.",
+            },
             "portfolio": normalized_portfolio,
         }
 
@@ -1015,24 +1027,32 @@ class TBankPortfolioAnalysisService:
     def _system_prompt(cls) -> str:
         return (
             "Ты инвестиционный AI-аналитик портфеля. Работай как агент: сначала изучи портфель из JSON, "
+            "особенно weight_percent, portfolio_rank, market_value, expected_yield и daily_yield. "
             "затем сам собери актуальное информационное поле через доступные web tools по каждому существенному активу, "
             "индексу Мосбиржи, рублю, ставке ЦБ, сырью и отраслевым факторам, если они важны для позиций. "
+            "Перед финальным ответом сделай внутреннюю проверку релевантности: факт должен быть связан с весом позиции "
+            "и попадать в analysis_window_msk. События вне горизонта запрещено выносить в ИТОГ или ФАКТОРЫ; "
+            "их можно упомянуть только в РИСКИ И ТРИГГЕРЫ и только одной короткой строкой. "
             "Для горизонта 1 день делай упор на свежие новости, рынок, технику и ближайшие события. "
             "Для 7 дней — на новости, календарь событий, дивиденды, отчеты, ставку и отраслевые драйверы. "
             "Для 1 месяца — на тренды, макро, ожидания по ставке, отчетности и корпоративные события. "
             "Для 1 года — на фундаментальные факторы, отрасли, ставку, дивидендную политику, санкции, валюту и циклы. "
-            "Не пиши воду. Каждое утверждение должно отвечать на вопрос: что это значит для портфеля и почему. "
+            "Не пиши воду. Каждое утверждение должно отвечать на вопрос: что это значит для портфеля, "
+            "какая позиция/класс активов затронуты и почему это важно именно на выбранный горизонт. "
             "Запрещены общие фразы без факта: 'рынок волатилен', 'может вырасти/упасть', 'проверьте новости'. "
+            "Запрещены расплывчатые связки: 'начинает влиять', 'участники учитывают', 'риск-аппетит' без конкретного "
+            "источника, даты, инструмента и механизма влияния. "
             "Если используешь внешний факт, укажи источник коротко в скобках. Не выдумывай цены, новости и события. "
             "Не давай прямых команд купить/продать и не обещай доходность. Пиши по-русски, четко и по делу. "
             "Структура ответа строго такая: "
-            "ИТОГ: 2-4 коротких предложения. "
-            "ФАКТОРЫ: 3-6 пунктов с причинами влияния на портфель. "
-            "ПО ПОЗИЦИЯМ: по каждой значимой позиции 1-2 предложения, без пересказа анкетных данных. "
-            "СЦЕНАРИЙ: базовый/позитивный/негативный на выбранный горизонт. "
-            "РИСКИ И ТРИГГЕРЫ: что конкретно следить дальше. "
+            "ИТОГ: направление портфеля на горизонт — позитивно/нейтрально/негативно; 2-3 причины по весам. "
+            "ФАКТОРЫ: 3-5 пунктов, только факты внутри горизонта или уже действующий фон; у каждого пункта укажи влияние. "
+            "ПО ПОЗИЦИЯМ: только позиции с существенным весом, в порядке portfolio_rank; формат 'тикер, вес — вывод'. "
+            "СЦЕНАРИЙ: базовый/позитивный/негативный на выбранный горизонт, без фантазий и без точных обещаний доходности. "
+            "РИСКИ И ТРИГГЕРЫ: конкретные уровни/даты/публикации/события, которые надо отслеживать дальше. "
             "В конце одна строка: 'Не является индивидуальной инвестиционной рекомендацией.' "
-            "Объем — до 4500 знаков."
+            "Если после web search нет релевантных фактов по горизонту, прямо напиши 'релевантных свежих факторов не найдено' "
+            "и не заменяй это общими словами. Объем — до 3800 знаков."
         )
 
     @staticmethod
@@ -1042,7 +1062,8 @@ class TBankPortfolioAnalysisService:
             "Дата и время расчета строго по Москве.\n"
             "Перед выводом используй web search, чтобы изучить актуальный фон вокруг позиций и рынка. "
             "Ищи по тикерам, названиям эмитентов, индексу IMOEX, ключевой ставке ЦБ РФ, рублю и важным сырьевым факторам. "
-            "Для малых позиций не трать много поиска; фокус на концентрациях и главных драйверах риска.\n\n"
+            "Для малых позиций не трать много поиска; фокус на концентрациях и главных драйверах риска. "
+            "Сначала проверь, попадает ли найденное событие в analysis_window_msk; если нет — не делай его главным выводом.\n\n"
             f"Данные портфеля:\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
         )
 
@@ -1066,6 +1087,7 @@ class TBankPortfolioAnalysisService:
             for position in safe_positions
             if isinstance(position, dict)
         ]
+        positions_payload = cls._enrich_position_weights(positions_payload, totals)
         return {
             "totals": totals,
             "positions_count": len(positions_payload),
@@ -1089,6 +1111,72 @@ class TBankPortfolioAnalysisService:
             "expected_yield": cls._money_payload(position.get("expectedYield")),
             "var_margin": cls._money_payload(position.get("varMargin")),
         }
+
+    @classmethod
+    def _enrich_position_weights(
+        cls,
+        positions: list[dict[str, Any]],
+        totals: dict[str, dict[str, str | None] | None],
+    ) -> list[dict[str, Any]]:
+        portfolio_total = cls._money_value_to_decimal(totals.get("portfolio"))
+        value_rows: list[tuple[dict[str, Any], Decimal | None]] = []
+        for position in positions:
+            market_value = cls._position_market_value(position)
+            if market_value is not None:
+                currency = None
+                current_price = position.get("current_price")
+                if isinstance(current_price, dict):
+                    currency = current_price.get("currency")
+                position["market_value"] = {
+                    "value": cls._decimal_to_text(market_value),
+                    "currency": currency,
+                }
+            value_rows.append((position, market_value))
+
+        if portfolio_total is None or portfolio_total <= 0:
+            calculated_total = sum(
+                value
+                for _, value in value_rows
+                if value is not None and value > 0
+            )
+            portfolio_total = calculated_total if calculated_total > 0 else None
+
+        sorted_rows = sorted(
+            value_rows,
+            key=lambda row: abs(row[1] or Decimal("0")),
+            reverse=True,
+        )
+        for rank, (position, market_value) in enumerate(sorted_rows, start=1):
+            position["portfolio_rank"] = rank
+            if portfolio_total is not None and portfolio_total > 0 and market_value is not None:
+                weight = (market_value / portfolio_total) * Decimal("100")
+                position["weight_percent"] = cls._decimal_to_text(
+                    weight.quantize(Decimal("0.01"))
+                )
+        return [position for position, _ in sorted_rows]
+
+    @classmethod
+    def _position_market_value(cls, position: dict[str, Any]) -> Decimal | None:
+        quantity = cls._text_to_decimal(position.get("quantity"))
+        current_price = cls._money_value_to_decimal(position.get("current_price"))
+        if quantity is None or current_price is None:
+            return None
+        return quantity * current_price
+
+    @classmethod
+    def _money_value_to_decimal(cls, raw_value: object) -> Decimal | None:
+        if not isinstance(raw_value, dict):
+            return None
+        return cls._text_to_decimal(raw_value.get("value"))
+
+    @staticmethod
+    def _text_to_decimal(raw_value: object) -> Decimal | None:
+        if raw_value is None:
+            return None
+        try:
+            return Decimal(str(raw_value))
+        except Exception:
+            return None
 
     @staticmethod
     def _money_payload(raw_value: object) -> dict[str, str | None] | None:
