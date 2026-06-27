@@ -27,10 +27,14 @@ class Settings(BaseSettings):
 
     AI_API_KEY: str = ""
     AI_BASE_URL: str = "https://api.proxyapi.ru/openrouter/v1"
-    AI_MODEL: str = "deepseek/deepseek-v3.2"
+    AI_MODEL: str = "openai/gpt-5.2"
     AI_TIMEOUT_SECONDS: int = 180
     AI_MAX_TOKENS: int = 4000
     AI_TEMPERATURE: float = 0.2
+    AI_WEB_SEARCH_ENABLED: bool = True
+    AI_WEB_SEARCH_ENGINE: str = "native"
+    AI_WEB_SEARCH_MAX_RESULTS: int = 5
+    AI_WEB_SEARCH_CONTEXT_SIZE: str = "high"
 
     @field_validator("TBANK_SYNC_INTERVAL_SECONDS", mode="before")
     @classmethod

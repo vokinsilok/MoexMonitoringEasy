@@ -368,11 +368,13 @@ def _write_portfolio_analysis_docx(payload: dict, path: Path) -> None:
 
     document.add_paragraph("")
     for block in report.split("\n"):
-        line = block.strip()
+        line = _clean_docx_report_line(block)
         if not line:
             document.add_paragraph("")
             continue
-        if line.startswith(("1)", "1.", "2)", "2.", "3)", "3.", "4)", "4.", "5)", "5.", "6)", "6.")):
+        if line.startswith(("#", "ИТОГ:", "ФАКТОРЫ:", "ПО ПОЗИЦИЯМ:", "СЦЕНАРИЙ:", "РИСКИ И ТРИГГЕРЫ:")):
+            document.add_heading(line.lstrip("# ").strip(), level=2)
+        elif line.startswith(("1)", "1.", "2)", "2.", "3)", "3.", "4)", "4.", "5)", "5.", "6)", "6.")):
             document.add_heading(line, level=2)
         elif line.startswith(("-", "•")):
             document.add_paragraph(line.lstrip("-• ").strip(), style="List Bullet")
@@ -383,6 +385,13 @@ def _write_portfolio_analysis_docx(payload: dict, path: Path) -> None:
     note = document.add_paragraph("Не является индивидуальной инвестиционной рекомендацией.")
     note.runs[0].italic = True
     document.save(path)
+
+
+def _clean_docx_report_line(raw_line: str) -> str:
+    line = str(raw_line or "").strip()
+    line = re.sub(r"\*\*(.*?)\*\*", r"\1", line)
+    line = re.sub(r"__(.*?)__", r"\1", line)
+    return line
 
 
 async def _send_portfolio_analysis_document(

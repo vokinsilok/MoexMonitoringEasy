@@ -30,6 +30,9 @@ class AIGatewayConnector:
         *,
         messages: list[dict[str, str]],
         reasoning: dict[str, Any] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        plugins: list[dict[str, Any]] | None = None,
+        web_search_options: dict[str, Any] | None = None,
     ) -> str:
         if not self.api_key:
             raise AIGatewayRequestError("AI API key is not configured")
@@ -44,6 +47,12 @@ class AIGatewayConnector:
         }
         if reasoning is not None:
             payload["reasoning"] = reasoning
+        if tools:
+            payload["tools"] = tools
+        if plugins:
+            payload["plugins"] = plugins
+        if web_search_options:
+            payload["web_search_options"] = web_search_options
 
         url = f"{self.base_url}/chat/completions"
         try:

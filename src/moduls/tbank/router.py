@@ -73,6 +73,26 @@ def _build_ai_connector() -> AIGatewayConnector:
     )
 
 
+def _build_ai_web_plugins() -> list[dict]:
+    plugins: list[dict] = []
+    if settings.AI_WEB_SEARCH_ENABLED:
+        web_plugin = {
+            "id": "web",
+            "max_results": settings.AI_WEB_SEARCH_MAX_RESULTS,
+        }
+        engine = settings.AI_WEB_SEARCH_ENGINE.strip()
+        if engine:
+            web_plugin["engine"] = engine
+        plugins.append(web_plugin)
+    return plugins
+
+
+def _build_ai_web_search_options() -> dict | None:
+    if not settings.AI_WEB_SEARCH_ENABLED:
+        return None
+    return {"search_context_size": settings.AI_WEB_SEARCH_CONTEXT_SIZE}
+
+
 async def _build_user_trading_service(db: DBDep, telegram_user_id: int) -> TBankTradingService:
     creds = await db.tbank_user_credential.get_active_by_telegram_user_id(telegram_user_id)
     if creds is None:
@@ -849,6 +869,8 @@ async def analyze_portfolio(
         trading_service=trading_service,
         ai_connector=_build_ai_connector(),
         model=settings.AI_MODEL,
+        web_plugins=_build_ai_web_plugins(),
+        web_search_options=_build_ai_web_search_options(),
     )
     try:
         return await analysis_service.analyze(horizon=payload.horizon)

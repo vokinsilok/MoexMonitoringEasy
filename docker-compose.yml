@@ -26,10 +26,14 @@ services:
       TBANK_MONITOR_EVENTS_QUEUE_KEY: ${TBANK_MONITOR_EVENTS_QUEUE_KEY:-tbank:monitor:events}
       AI_API_KEY: ${AI_API_KEY:-}
       AI_BASE_URL: ${AI_BASE_URL:-https://api.proxyapi.ru/openrouter/v1}
-      AI_MODEL: ${AI_MODEL:-deepseek/deepseek-v3.2}
+      AI_MODEL: ${AI_MODEL:-openai/gpt-5.2}
       AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-90}
       AI_MAX_TOKENS: ${AI_MAX_TOKENS:-4000}
       AI_TEMPERATURE: ${AI_TEMPERATURE:-0.2}
+      AI_WEB_SEARCH_ENABLED: ${AI_WEB_SEARCH_ENABLED:-true}
+      AI_WEB_SEARCH_ENGINE: ${AI_WEB_SEARCH_ENGINE:-native}
+      AI_WEB_SEARCH_MAX_RESULTS: ${AI_WEB_SEARCH_MAX_RESULTS:-5}
+      AI_WEB_SEARCH_CONTEXT_SIZE: ${AI_WEB_SEARCH_CONTEXT_SIZE:-high}
     depends_on:
       postgres:
         condition: service_healthy
