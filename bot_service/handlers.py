@@ -422,10 +422,16 @@ def _portfolio_analysis_error_text(exc: RuntimeError) -> str:
             "AI-анализ пока не настроен: сервер не видит ключ ProxyAPI.\n\n"
             "Проверьте переменную <code>AI_API_KEY</code> на сервере."
         )
-    if "больше времени" in lowered or "timeout" in lowered or "timed out" in lowered:
+    if (
+        "больше времени" in lowered
+        or "timeout" in lowered
+        or "timed out" in lowered
+        or "ai gateway" in lowered
+        or "gateway" in lowered
+    ):
         return (
-            "AI-анализ не успел завершиться за отведенное время.\n\n"
-            "Попробуйте еще раз через минуту. Если повторится, уменьшим размер отчета или переключим модель."
+            "AI-сервис не успел подготовить отчет.\n\n"
+            "Портфель собран, но модель ответила слишком долго. Повторите попытку чуть позже."
         )
     if "t-bank" in lowered or "tbank" in lowered:
         return (
@@ -2080,7 +2086,7 @@ async def portfolio_analysis_callback(callback: CallbackQuery) -> None:
         callback.message.answer(
             "🤖 <b>Запустил анализ портфеля</b>\n"
             f"Горизонт: <b>{html.escape(horizon_label)}</b>\n\n"
-            "Собираю позиции, структуру и доходность. Обычно отчет готов за 20–60 секунд."
+            "Собираю позиции, структуру и доходность. Обычно отчет готов за 30–120 секунд."
         )
     )
     try:

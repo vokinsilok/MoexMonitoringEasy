@@ -14,7 +14,7 @@ class AIGatewayConnector:
         api_key: str,
         base_url: str,
         model: str,
-        timeout: float = 90.0,
+        timeout: float = 180.0,
         max_tokens: int = 4000,
         temperature: float = 0.2,
     ) -> None:
@@ -57,6 +57,10 @@ class AIGatewayConnector:
                         "Accept": "application/json",
                     },
                 )
+        except httpx.TimeoutException as exc:
+            raise AIGatewayRequestError(
+                f"AI gateway request timed out after {self.timeout:.0f} seconds"
+            ) from exc
         except httpx.HTTPError as exc:
             raise AIGatewayRequestError(f"Unable to reach AI gateway: {exc}") from exc
 

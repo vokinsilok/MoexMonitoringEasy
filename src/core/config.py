@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     AI_API_KEY: str = ""
     AI_BASE_URL: str = "https://api.proxyapi.ru/openrouter/v1"
     AI_MODEL: str = "deepseek/deepseek-v3.2"
-    AI_TIMEOUT_SECONDS: int = 90
+    AI_TIMEOUT_SECONDS: int = 180
     AI_MAX_TOKENS: int = 4000
     AI_TEMPERATURE: float = 0.2
 
