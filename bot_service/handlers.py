@@ -3420,6 +3420,94 @@ def _share_details_text_legacy(item: ShareViewItem) -> str:
 _share_details_text = _share_details_text_legacy
 
 
+def _portfolio_type_label(raw_type: object) -> str:
+    value = str(raw_type or "").strip().lower()
+    labels = {
+        "share": "Акция",
+        "bond": "Облигация",
+        "etf": "Фонд",
+        "currency": "Валюта",
+        "futures": "Фьючерс",
+        "future": "Фьючерс",
+        "option": "Опцион",
+        "sp": "Структурный продукт",
+        "clearing_certificate": "Клиринговый сертификат",
+    }
+    return labels.get(value, value.upper() if value else "Инструмент")
+
+
+def _pl_badge(value: Decimal | None) -> str:
+    if value is None or value == 0:
+        return "⚪"
+    return "🟢" if value > 0 else "🔴"
+
+
+def _format_money_human(raw: dict | None, fallback_currency: str = "RUB", decimals: int = 2) -> str:
+    dec = _money_from_quotation(raw)
+    if dec is None:
+        return "—"
+    currency = _extract_currency(raw, fallback_currency)
+    return f"{_format_decimal_human(dec, decimals=decimals)} {currency}"
+
+
+def _format_signed_money(value: Decimal | None, currency: str = "RUB") -> str:
+    if value is None:
+        return "—"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{_format_decimal_human(value)} {currency}"
+
+
+def _format_signed_percent(value: Decimal | None) -> str:
+    if value is None:
+        return "—"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{_format_decimal_human(value, decimals=2)}%"
+
+
+def _portfolio_total_from_details(details: dict) -> Decimal:
+    total_from_api = _money_from_quotation(details.get("totalAmountPortfolio"))
+    if total_from_api is not None:
+        return total_from_api
+    return sum(
+        (
+            _money_from_quotation(details.get(key)) or Decimal("0")
+            for key in (
+                "totalAmountShares",
+                "totalAmountBonds",
+                "totalAmountEtf",
+                "totalAmountCurrencies",
+                "totalAmountFutures",
+                "totalAmountOptions",
+            )
+        ),
+        Decimal("0"),
+    )
+
+
+def _format_allocation_line(label: str, amount: Decimal | None, total: Decimal, currency: str) -> str:
+    value = amount or Decimal("0")
+    percent = "—"
+    if total > 0:
+        percent = _format_decimal_human((value / total * Decimal("100")).quantize(Decimal("0.01")), decimals=2)
+    return f"• {label}: <b>{_format_decimal_human(value)} {currency}</b> · {percent}%"
+
+
+def _position_market_value(pos: dict) -> Decimal | None:
+    quantity = _money_from_quotation(pos.get("quantity"))
+    current_price = _money_from_quotation(pos.get("currentPrice"))
+    if quantity is None or current_price is None:
+        return None
+    return quantity * current_price
+
+
+def _position_yield_percent(pos: dict) -> Decimal | None:
+    avg_price = _money_from_quotation(pos.get("averagePositionPrice"))
+    current_price = _money_from_quotation(pos.get("currentPrice"))
+    if avg_price is None or current_price is None or avg_price == 0:
+        return None
+    return ((current_price - avg_price) / avg_price * Decimal("100")).quantize(Decimal("0.01"))
+
+
 def _render_portfolio(details: dict) -> str:
     if not isinstance(details, dict):
         return "💼 <b>Портфель T-Bank</b>\nДанные портфеля пока недоступны."
@@ -3429,29 +3517,34 @@ def _render_portfolio(details: dict) -> str:
     total_etf = _money_from_quotation(details.get("totalAmountEtf"))
     total_curr = _money_from_quotation(details.get("totalAmountCurrencies"))
     total_futures = _money_from_quotation(details.get("totalAmountFutures"))
+    total_options = _money_from_quotation(details.get("totalAmountOptions"))
     expected_yield = _money_from_quotation(details.get("expectedYield"))
-    currency = _extract_currency(details.get("totalAmountShares"), "RUB")
-    total_all = (
-        (total_shares or Decimal("0"))
-        + (total_bonds or Decimal("0"))
-        + (total_etf or Decimal("0"))
-        + (total_curr or Decimal("0"))
-        + (total_futures or Decimal("0"))
-    )
-    pl_badge = "🟢" if (expected_yield or Decimal("0")) > 0 else "🔴" if (expected_yield or Decimal("0")) < 0 else "⚪"
-    pl_text = f"{_format_decimal_human(expected_yield)} {currency}" if expected_yield is not None else "—"
+    daily_yield = _money_from_quotation(details.get("dailyYield"))
+    currency = _extract_currency(details.get("totalAmountPortfolio"), _extract_currency(details.get("totalAmountShares"), "RUB"))
+    total_all = _portfolio_total_from_details(details)
+    yield_percent = None
+    if expected_yield is not None and total_all - expected_yield != 0:
+        yield_percent = (expected_yield / (total_all - expected_yield) * Decimal("100")).quantize(Decimal("0.01"))
+
     lines = [
         "💼 <b>Портфель T-Bank</b>",
         f"Итого: <b>{_format_decimal_human(total_all)} {currency}</b>",
-        f"{pl_badge} P/L: <b>{pl_text}</b>",
+        f"{_pl_badge(expected_yield)} Прибыль/убыток: <b>{_format_signed_money(expected_yield, currency)}</b> · {_format_signed_percent(yield_percent)}",
+    ]
+    if daily_yield is not None:
+        lines.append(f"{_pl_badge(daily_yield)} За день: <b>{_format_signed_money(daily_yield, currency)}</b>")
+    lines.extend([
         "",
         "📦 <b>Структура</b>",
-        f"• Акции: <b>{_format_decimal_human(total_shares)} {currency}</b>",
-        f"• Облигации: <b>{_format_decimal_human(total_bonds)} {currency}</b>",
-        f"• Фонды: <b>{_format_decimal_human(total_etf)} {currency}</b>",
-        f"• Валюты: <b>{_format_decimal_human(total_curr)} {currency}</b>",
-        f"• Фьючерсы: <b>{_format_decimal_human(total_futures)} {currency}</b>",
-    ]
+        _format_allocation_line("Акции", total_shares, total_all, currency),
+        _format_allocation_line("Облигации", total_bonds, total_all, currency),
+        _format_allocation_line("Фонды", total_etf, total_all, currency),
+        _format_allocation_line("Валюты", total_curr, total_all, currency),
+        _format_allocation_line("Фьючерсы", total_futures, total_all, currency),
+    ])
+    if total_options is not None and total_options != 0:
+        lines.append(_format_allocation_line("Опционы", total_options, total_all, currency))
+
     positions = details.get("positions")
     if not isinstance(positions, list) or not positions:
         lines.append("")
@@ -3459,32 +3552,42 @@ def _render_portfolio(details: dict) -> str:
         lines.append("Открытых позиций пока нет.")
         return "\n".join(lines)
 
+    valid_positions = [pos for pos in positions if isinstance(pos, dict)]
+    display_positions = sorted(
+        valid_positions,
+        key=lambda pos: abs(_position_market_value(pos) or Decimal("0")),
+        reverse=True,
+    )
+
     lines.append("")
-    lines.append(f"🧾 <b>Позиции ({len(positions)})</b>")
-    for i, pos in enumerate(positions[:12], start=1):
-        if not isinstance(pos, dict):
-            continue
+    lines.append(f"🧾 <b>Позиции ({len(valid_positions)})</b>")
+    for i, pos in enumerate(display_positions[:12], start=1):
         ticker = str(pos.get("ticker") or pos.get("figi") or "UNKNOWN")
-        instrument_type = str(pos.get("instrumentType") or "unknown")
+        instrument_type = _portfolio_type_label(pos.get("instrumentType"))
         quantity_lots = _format_decimal_plain(_money_from_quotation(pos.get("quantityLots")))
         quantity_total = _format_decimal_plain(_money_from_quotation(pos.get("quantity")))
         pos_currency = _extract_currency(pos.get("currentPrice"), currency)
-        avg_price = _format_money(pos.get("averagePositionPrice"), fallback_currency=pos_currency)
-        current_price = _format_money(pos.get("currentPrice"), fallback_currency=pos_currency)
+        avg_price = _format_money_human(pos.get("averagePositionPrice"), fallback_currency=pos_currency)
+        current_price = _format_money_human(pos.get("currentPrice"), fallback_currency=pos_currency)
         pos_yield_raw = pos.get("expectedYield")
-        pos_yield = _format_money(pos_yield_raw, fallback_currency=pos_currency)
         pos_yield_dec = _decimal_from_any(pos_yield_raw)
-        pos_yield_badge = "🟢" if (pos_yield_dec or Decimal("0")) > 0 else "🔴" if (pos_yield_dec or Decimal("0")) < 0 else "⚪"
+        pos_yield_percent = _position_yield_percent(pos)
+        market_value = _position_market_value(pos)
+        weight_text = "—"
+        if market_value is not None and total_all > 0:
+            weight_text = f"{_format_decimal_human((market_value / total_all * Decimal('100')).quantize(Decimal('0.01')), decimals=2)}%"
+        market_value_text = f"{_format_decimal_human(market_value)} {pos_currency}" if market_value is not None else "—"
         blocked = bool(pos.get("blocked"))
         blocked_lots = _format_decimal_plain(_money_from_quotation(pos.get("blockedLots")))
         lines.append(f"{i}. <b>{html.escape(ticker)}</b> · {html.escape(instrument_type)}")
-        lines.append(f"   Лоты/шт: <b>{quantity_lots}</b> / <b>{quantity_total}</b>")
-        lines.append(f"   Средняя → Текущая: <b>{avg_price}</b> → <b>{current_price}</b>")
-        lines.append(f"   {pos_yield_badge} P/L: <b>{pos_yield}</b>")
-        lines.append(f"   Блокировка: <b>{'Да' if blocked else 'Нет'}</b> (лотов: <b>{blocked_lots}</b>)")
-    if len(positions) > 12:
+        lines.append(f"   Стоимость: <b>{market_value_text}</b> · Доля: <b>{weight_text}</b>")
+        lines.append(f"   Количество: <b>{quantity_total}</b> · Лоты: <b>{quantity_lots}</b>")
+        lines.append(f"   Цена: <b>{avg_price}</b> → <b>{current_price}</b>")
+        lines.append(f"   {_pl_badge(pos_yield_dec)} P/L: <b>{_format_signed_money(pos_yield_dec, pos_currency)}</b> · {_format_signed_percent(pos_yield_percent)}")
+        lines.append(f"   Блокировка: <b>{'есть' if blocked else 'нет'}</b> · лотов: <b>{blocked_lots}</b>")
+    if len(valid_positions) > 12:
         lines.append("")
-        lines.append(f"Показаны первые <b>12</b> из <b>{len(positions)}</b> позиций.")
+        lines.append(f"Показаны первые <b>12</b> из <b>{len(valid_positions)}</b> позиций по размеру позиции.")
     return "\n".join(lines)
 
 

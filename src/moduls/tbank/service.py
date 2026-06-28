@@ -245,6 +245,11 @@ class TBankSharesService:
         for item in items:
             details = details_by_figi.get(item.figi, {})
             last_price = prices_by_figi.get(item.figi)
+            last_price = self._normalize_quoted_price_for_display(
+                price=last_price,
+                instrument_type=item.instrument_type,
+                nominal=self._nominal_decimal_from_text(details.get("nominal")),
+            )
             captured_at_msk = captured_at_by_figi.get(item.figi)
             exchange_display = self._to_exchange_display(item.real_exchange, item.exchange)
             response_items.append(
@@ -326,17 +331,25 @@ class TBankSharesService:
         real_exchange_value = self._to_str_or_none(instrument.get("realExchange"))
         resolved_type = self._resolve_instrument_type(instrument, fallback=resolved_type)
 
+        raw_price_value: Decimal | None = None
         price_value: Decimal | None = None
         price_captured_at_msk: str | None = None
         try:
             points = await self.connector.get_last_price_points([instrument_figi])
             point = points.get(instrument_figi)
             if point is not None:
-                price_value = point.price
+                raw_price_value = point.price
                 if point.captured_at_msk is not None:
                     price_captured_at_msk = point.captured_at_msk.isoformat()
         except TBankInvestRequestError:
             point = None
+
+        nominal_value = self._nominal_decimal_from_instrument(instrument)
+        price_value = self._normalize_quoted_price_for_display(
+            price=raw_price_value,
+            instrument_type=resolved_type,
+            nominal=nominal_value,
+        )
 
         trading_status = await self._resolve_trading_status_for_instrument(
             exchange=exchange_value,
@@ -355,7 +368,7 @@ class TBankSharesService:
             "year_change_percent": None,
         }
         try:
-            metrics = await self.connector.get_daily_metrics(figi=instrument_figi, current_price=price_value)
+            metrics = await self.connector.get_daily_metrics(figi=instrument_figi, current_price=raw_price_value)
         except TBankInvestRequestError:
             metrics = {
                 "day_open_price": None,
@@ -363,6 +376,11 @@ class TBankSharesService:
                 "day_change_percent": None,
                 "year_change_percent": None,
             }
+        metrics = self._normalize_metrics_for_display(
+            metrics=metrics,
+            instrument_type=resolved_type,
+            nominal=nominal_value,
+        )
 
         exchange_display = self._to_exchange_display(real_exchange_value, exchange_value)
 
@@ -717,6 +735,70 @@ class TBankSharesService:
         if currency:
             return f"{normalized} {currency}"
         return normalized
+
+    @classmethod
+    def _nominal_decimal_from_instrument(cls, instrument: dict) -> Decimal | None:
+        raw_nominal = instrument.get("nominal")
+        if not isinstance(raw_nominal, dict):
+            return None
+        return cls._decimal_from_units_nano(raw_nominal)
+
+    @staticmethod
+    def _nominal_decimal_from_text(raw_value: object) -> Decimal | None:
+        if not isinstance(raw_value, str):
+            return None
+        first_part = raw_value.strip().replace(",", ".").split(" ", 1)[0]
+        if not first_part:
+            return None
+        try:
+            return Decimal(first_part)
+        except Exception:
+            return None
+
+    @classmethod
+    def _normalize_quoted_price_for_display(
+        cls,
+        *,
+        price: Decimal | None,
+        instrument_type: str | None,
+        nominal: Decimal | None,
+    ) -> Decimal | None:
+        if price is None:
+            return None
+        if cls._is_bond_type(instrument_type) and nominal is not None and nominal > 0:
+            return price * nominal / Decimal("100")
+        return price
+
+    @classmethod
+    def _normalize_metrics_for_display(
+        cls,
+        *,
+        metrics: dict[str, Decimal | None],
+        instrument_type: str | None,
+        nominal: Decimal | None,
+    ) -> dict[str, Decimal | None]:
+        normalized = dict(metrics)
+        for key in ("day_open_price", "day_close_price"):
+            value = normalized.get(key)
+            normalized[key] = cls._normalize_quoted_price_for_display(
+                price=value if isinstance(value, Decimal) else None,
+                instrument_type=instrument_type,
+                nominal=nominal,
+            )
+        return normalized
+
+    @staticmethod
+    def _is_bond_type(instrument_type: str | None) -> bool:
+        return str(instrument_type or "").strip().lower() == "bond"
+
+    @staticmethod
+    def _decimal_from_units_nano(raw_value: dict) -> Decimal | None:
+        try:
+            units = int(raw_value.get("units", 0))
+            nano = int(raw_value.get("nano", 0))
+        except (TypeError, ValueError):
+            return None
+        return Decimal(units) + (Decimal(nano) / Decimal(1_000_000_000))
 
     @staticmethod
     def _to_int_or_none(raw_value: object) -> int | None:
