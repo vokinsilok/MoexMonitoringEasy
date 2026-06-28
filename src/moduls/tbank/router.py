@@ -1,5 +1,6 @@
 import asyncio
 from decimal import Decimal
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -145,6 +146,36 @@ def _to_bot_access_status_response(row, *, default_user_id: int | None = None) -
         approved_by=getattr(row, "approved_by", None),
         revoked_by=getattr(row, "revoked_by", None),
     )
+
+
+async def _enrich_portfolio_positions_with_instrument_names(result: dict[str, Any], db: DBDep) -> dict[str, Any]:
+    positions = result.get("positions")
+    if not isinstance(positions, list):
+        return result
+
+    figies = [
+        str(position.get("figi") or "").strip()
+        for position in positions
+        if isinstance(position, dict) and str(position.get("figi") or "").strip()
+    ]
+    instruments = await db.tbank_share.list_active_by_figies(figies)
+    by_figi = {instrument.figi: instrument for instrument in instruments}
+
+    for position in positions:
+        if not isinstance(position, dict):
+            continue
+        figi = str(position.get("figi") or "").strip()
+        instrument = by_figi.get(figi)
+        if instrument is None:
+            continue
+        if instrument.instrument_name:
+            position["instrumentName"] = instrument.instrument_name
+        if instrument.instrument_type:
+            position.setdefault("instrumentType", instrument.instrument_type)
+        if instrument.ticker:
+            position.setdefault("ticker", instrument.ticker)
+
+    return result
 
 
 @tbank_router.get(
@@ -912,6 +943,7 @@ async def get_portfolio(payload: TBankPortfolioRequest, db: DBDep) -> TBankTradi
     service = await _build_user_trading_service(db=db, telegram_user_id=payload.telegram_user_id)
     try:
         result = await service.get_portfolio()
+        result = await _enrich_portfolio_positions_with_instrument_names(result, db)
         return TBankTradingActionResponse(ok=True, details=result)
     except TBankInvestRequestError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

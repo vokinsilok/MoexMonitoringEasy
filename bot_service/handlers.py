@@ -3436,6 +3436,14 @@ def _portfolio_type_label(raw_type: object) -> str:
     return labels.get(value, value.upper() if value else "Инструмент")
 
 
+def _portfolio_position_title(pos: dict, ticker: str) -> str:
+    for key in ("instrumentName", "instrument_name", "name"):
+        value = str(pos.get(key) or "").strip()
+        if value and value.upper() != ticker.upper():
+            return value
+    return ticker
+
+
 def _pl_badge(value: Decimal | None) -> str:
     if value is None or value == 0:
         return "⚪"
@@ -3460,8 +3468,11 @@ def _format_signed_money(value: Decimal | None, currency: str = "RUB") -> str:
 def _format_signed_percent(value: Decimal | None) -> str:
     if value is None:
         return "—"
-    sign = "+" if value > 0 else ""
-    return f"{sign}{_format_decimal_human(value, decimals=2)}%"
+    rounded = value.quantize(Decimal("0.01"))
+    if rounded == 0:
+        return "0%"
+    sign = "+" if rounded > 0 else ""
+    return f"{sign}{_format_decimal_human(rounded, decimals=2)}%"
 
 
 def _portfolio_total_from_details(details: dict) -> Decimal:
@@ -3563,6 +3574,7 @@ def _render_portfolio(details: dict) -> str:
     lines.append(f"🧾 <b>Позиции ({len(valid_positions)})</b>")
     for i, pos in enumerate(display_positions[:12], start=1):
         ticker = str(pos.get("ticker") or pos.get("figi") or "UNKNOWN")
+        title = _portfolio_position_title(pos, ticker)
         instrument_type = _portfolio_type_label(pos.get("instrumentType"))
         quantity_lots = _format_decimal_plain(_money_from_quotation(pos.get("quantityLots")))
         quantity_total = _format_decimal_plain(_money_from_quotation(pos.get("quantity")))
@@ -3579,7 +3591,10 @@ def _render_portfolio(details: dict) -> str:
         market_value_text = f"{_format_decimal_human(market_value)} {pos_currency}" if market_value is not None else "—"
         blocked = bool(pos.get("blocked"))
         blocked_lots = _format_decimal_plain(_money_from_quotation(pos.get("blockedLots")))
-        lines.append(f"{i}. <b>{html.escape(ticker)}</b> · {html.escape(instrument_type)}")
+        if i > 1:
+            lines.append("────────────")
+        lines.append(f"{i}. <b>{html.escape(title)}</b>")
+        lines.append(f"   <code>{html.escape(ticker)}</code> · {html.escape(instrument_type)}")
         lines.append(f"   Стоимость: <b>{market_value_text}</b> · Доля: <b>{weight_text}</b>")
         lines.append(f"   Количество: <b>{quantity_total}</b> · Лоты: <b>{quantity_lots}</b>")
         lines.append(f"   Цена: <b>{avg_price}</b> → <b>{current_price}</b>")
